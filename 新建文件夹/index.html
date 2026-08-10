@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>山海行旅 - 旅游网站设计方案</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script defer src="./app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span>
+          </div>
+          <div class="brand-copy">
+            <strong>山海行旅</strong>
+            <span>B+C 双端旅游内容平台方案</span>
+          </div>
+        </div>
+
+        <nav class="view-switcher" aria-label="方案视图切换">
+          <button class="tab is-active" type="button" data-view="brief">方案</button>
+          <button class="tab" type="button" data-view="structure">结构</button>
+          <button class="tab" type="button" data-view="visual">视觉</button>
+          <button class="tab" type="button" data-view="tech">技术</button>
+        </nav>
+
+        <div class="topbar-note">
+          <span class="note-label">当前假设</span>
+          <span> B 端 = 景区 / 民宿 / 本地体验 / 达人机构</span>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="hero-band">
+          <div class="hero-copy">
+            <p class="eyebrow">内容种草平台 · 轻交易闭环</p>
+            <h1>把“想去”变成“能去”，让旅行灵感直接进入行程。</h1>
+            <p class="lede">
+              这份方案默认把 B 端定义为景区、民宿、本地体验商家和达人机构。
+              网站以内容为入口，串起收藏、规划、咨询与轻预订，既能做品牌种草，也能做生意转化。
+            </p>
+
+            <div class="flowline" aria-label="核心用户闭环">
+              <span>发现</span>
+              <i aria-hidden="true"></i>
+              <span>收藏</span>
+              <i aria-hidden="true"></i>
+              <span>规划</span>
+              <i aria-hidden="true"></i>
+              <span>咨询</span>
+              <i aria-hidden="true"></i>
+              <span>预订</span>
+            </div>
+
+            <div class="hero-stats" aria-label="方案要点">
+              <div>
+                <strong>定位</strong>
+                <span>内容 + 工具 + 轻交易</span>
+              </div>
+              <div>
+                <strong>目标用户</strong>
+                <span>C 端旅人 / B 端供给方</span>
+              </div>
+              <div>
+                <strong>差异化</strong>
+                <span>长内容 + 行程编排 + 真实口碑</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="hero-visual">
+            <div class="role-switcher" id="roleSwitcher" aria-label="B 端角色切换"></div>
+
+            <div class="visual-stage">
+              <svg class="route-map" viewBox="0 0 720 520" role="img" aria-label="旅游内容平台路线示意图">
+                <defs>
+                  <pattern id="grid" width="72" height="72" patternUnits="userSpaceOnUse">
+                    <path d="M 72 0 L 0 0 0 72" fill="none" stroke="rgba(21,32,43,0.08)" stroke-width="1" />
+                  </pattern>
+                </defs>
+                <rect x="0" y="0" width="720" height="520" rx="10" fill="#f7f4ed" />
+                <rect x="0" y="0" width="720" height="520" rx="10" fill="url(#grid)" />
+
+                <path
+                  class="route"
+                  d="M88 392 C 160 320, 210 286, 276 248 S 420 152, 496 182 S 594 270, 642 164"
+                  fill="none"
+                  stroke-width="4"
+                  stroke-linecap="round"
+                />
+
+                <path
+                  class="route-soft"
+                  d="M88 392 C 160 320, 210 286, 276 248 S 420 152, 496 182 S 594 270, 642 164"
+                  fill="none"
+                  stroke-width="10"
+                  stroke-linecap="round"
+                />
+
+                <g class="pin pin-a">
+                  <circle cx="132" cy="360" r="20" />
+                  <circle cx="132" cy="360" r="7" />
+                  <text x="162" y="365">灵感</text>
+                </g>
+                <g class="pin pin-b">
+                  <circle cx="342" cy="220" r="20" />
+                  <circle cx="342" cy="220" r="7" />
+                  <text x="372" y="225">内容</text>
+                </g>
+                <g class="pin pin-c">
+                  <circle cx="574" cy="190" r="20" />
+                  <circle cx="574" cy="190" r="7" />
+                  <text x="604" y="195">转化</text>
+                </g>
+
+                <g class="label-chip">
+                  <rect x="38" y="36" width="118" height="34" rx="6" />
+                  <text x="56" y="58">周末近郊</text>
+                </g>
+                <g class="label-chip alt">
+                  <rect x="548" y="412" width="132" height="34" rx="6" />
+                  <text x="566" y="434">路线 + 预订</text>
+                </g>
+              </svg>
+
+              <div class="floating-card card-a">
+                <span class="card-kicker">B 端角色</span>
+                <strong id="roleTitle">景区</strong>
+                <p id="roleIntro">官方内容、活动日历、门票和套票转化。</p>
+              </div>
+
+              <div class="floating-card card-b">
+                <span class="card-kicker">关键指标</span>
+                <div class="metric-row">
+                  <span>曝光</span>
+                  <span>收藏</span>
+                  <span>咨询</span>
+                  <span>下单</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="role-detail" id="roleDetail"></div>
+          </div>
+        </section>
+
+        <section class="prototype-band">
+          <div class="section-head">
+            <p class="section-kicker">首页首屏示意</p>
+            <h2>旅人先进入一个可筛选的灵感台。</h2>
+          </div>
+
+          <div class="search-console">
+            <label class="search-field" for="travelSearch">
+              <span>搜索</span>
+              <input id="travelSearch" type="search" placeholder="海岛、徒步、亲子、民宿、美食" />
+            </label>
+            <div class="filter-row" id="moodFilters" aria-label="主题筛选"></div>
+          </div>
+
+          <div class="story-grid" id="storyGrid" aria-live="polite"></div>
+        </section>
+
+        <section class="content-grid">
+          <article class="panel">
+            <div class="section-head">
+              <p class="section-kicker">产品定位</p>
+              <h2>先做内容平台，再把交易接上。</h2>
+            </div>
+            <ul class="spec-list">
+              <li>入口是目的地灵感、攻略、路线和达人内容。</li>
+              <li>中段是收藏、行程编排、比价和咨询。</li>
+              <li>末端是轻预订、套餐、私信转化和会员工具。</li>
+              <li>经营侧兼顾 B 端入驻、内容分发和数据看板。</li>
+            </ul>
+          </article>
+
+          <article class="panel">
+            <div class="section-head">
+              <p class="section-kicker">核心闭环</p>
+              <h2>内容驱动的旅行决策链</h2>
+            </div>
+            <div class="journey-map">
+              <div class="journey-step">
+                <strong>发现</strong>
+                <span>目的地 / 达人 / 主题内容</span>
+              </div>
+              <div class="journey-arrow" aria-hidden="true">→</div>
+              <div class="journey-step">
+                <strong>收藏</strong>
+                <span>书签、清单、标签化管理</span>
+              </div>
+              <div class="journey-arrow" aria-hidden="true">→</div>
+              <div class="journey-step">
+                <strong>规划</strong>
+                <span>AI 行程、地图、时间线</span>
+              </div>
+              <div class="journey-arrow" aria-hidden="true">→</div>
+              <div class="journey-step">
+                <strong>咨询</strong>
+                <span>B 端响应、真人服务</span>
+              </div>
+              <div class="journey-arrow" aria-hidden="true">→</div>
+              <div class="journey-step">
+                <strong>预订</strong>
+                <span>门票、套餐、民宿、本地体验</span>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <section class="content-grid two-up">
+          <article class="panel">
+            <div class="section-head">
+              <p class="section-kicker">信息架构</p>
+              <h2>首页、目的地、内容、行程、B 端后台。</h2>
+            </div>
+            <div class="ia-table">
+              <div class="ia-row ia-head">
+                <span>页面</span>
+                <span>作用</span>
+                <span>核心组件</span>
+              </div>
+              <div class="ia-row">
+                <span>首页</span>
+                <span>灵感入口</span>
+                <span>目的地卡、主题榜单、达人推荐</span>
+              </div>
+              <div class="ia-row">
+                <span>目的地页</span>
+                <span>聚合内容</span>
+                <span>地图、内容流、商家条目、标签筛选</span>
+              </div>
+              <div class="ia-row">
+                <span>内容详情</span>
+                <span>决策页</span>
+                <span>图文、视频、路线、收藏、咨询按钮</span>
+              </div>
+              <div class="ia-row">
+                <span>行程页</span>
+                <span>执行页</span>
+                <span>日程、地图、预算、提醒</span>
+              </div>
+              <div class="ia-row">
+                <span>B 端后台</span>
+                <span>运营页</span>
+                <span>内容管理、订单、咨询、数据分析</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="section-head">
+              <p class="section-kicker">设计系统</p>
+              <h2>轻量、清晰、可重复。</h2>
+            </div>
+            <div class="palette">
+              <div class="swatch">
+                <i style="background:#f7f4ed"></i>
+                <span>米白底</span>
+              </div>
+              <div class="swatch">
+                <i style="background:#17323b"></i>
+                <span>墨蓝字</span>
+              </div>
+              <div class="swatch">
+                <i style="background:#167a7f"></i>
+                <span>海湾青</span>
+              </div>
+              <div class="swatch">
+                <i style="background:#d86a4d"></i>
+                <span>珊瑚橘</span>
+              </div>
+              <div class="swatch">
+                <i style="background:#c79a43"></i>
+                <span>琥珀金</span>
+              </div>
+            </div>
+            <ul class="spec-list compact">
+              <li>组件边角 6px，尽量用结构线而不是厚阴影。</li>
+              <li>信息区块保持全宽，重复项再用卡片。</li>
+              <li>按钮、标签、状态都要一眼可扫。</li>
+              <li>地图、列表、时间线并列出现，不依赖单一视觉。</li>
+            </ul>
+          </article>
+        </section>
+
+        <section class="content-grid">
+          <article class="panel">
+            <div class="section-head">
+              <p class="section-kicker">执行节奏</p>
+              <h2>MVP 先把最值钱的三件事做完。</h2>
+            </div>
+            <div class="roadmap">
+              <div class="roadmap-item">
+                <strong>阶段 1</strong>
+                <span>定位、内容模型、信息架构、视觉系统</span>
+              </div>
+              <div class="roadmap-item">
+                <strong>阶段 2</strong>
+                <span>首页、目的地页、内容详情、收藏与咨询</span>
+              </div>
+              <div class="roadmap-item">
+                <strong>阶段 3</strong>
+                <span>行程编排、B 端入驻、内容审核、数据看板</span>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <section class="footer-band">
+          <div class="footer-copy">
+            <p class="section-kicker">技术建议</p>
+            <h2>前台用 React / Next.js，内容层接 Headless CMS，搜索和地图单独拆。</h2>
+          </div>
+          <div class="tech-rail">
+            <span>Next.js</span>
+            <span>Headless CMS</span>
+            <span>搜索服务</span>
+            <span>地图服务</span>
+            <span>埋点分析</span>
+            <span>消息/咨询</span>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

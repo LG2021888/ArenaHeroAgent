@@ -1,0 +1,10 @@
+.env
+.claude/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log*
+arena_agent_state.json
+arena_agent_trace.jsonl*
+arena_agent_stats.json
