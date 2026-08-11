@@ -92,6 +92,7 @@ assert PATH_COST_UNREACHABLE > IDLE_ASSIGNMENT_COST
 CORE_ALERT_DISTANCE = 12
 CORE_EVADE_DISTANCE = 8
 WORKER_EVADE_DISTANCE = 5
+WORKER_ESCAPE_SEARCH_DEPTH = 4
 POST_THREAT_CAUTION_TICKS = 8
 PURSUIT_MEMORY_TTL = 2
 PURSUIT_SCORE_MAX = 4
@@ -133,6 +134,7 @@ EARLY_DEFENSE_WORKER_GOAL = 4
 EARLY_DEFENSE_VANGUARD_TARGET = 1
 EARLY_DEFENSE_RANGER_TARGET = 1
 RECENT_ATTACK_MEMORY_TICKS = 6
+MOVE_CONTESTED_AVOID_TICKS = 3
 
 
 class _Ansi:
@@ -367,6 +369,12 @@ class ThreatAssessment:
 
 
 @dataclass(frozen=True)
+class CoreMoveIntent:
+    direction: Direction
+    remember_escape_direction: bool = False
+
+
+@dataclass(frozen=True)
 class EnemyMotion:
     position: Position
     last_tick: int
@@ -460,6 +468,7 @@ class TacticMemory:
     threat_caution_until_tick: int = 0
     recent_attack_until_tick: int = 0
     recent_attack_positions: dict[Position, int] = field(default_factory=dict)
+    recent_combat_danger_positions: dict[Position, int] = field(default_factory=dict)
     recovery_until_tick: int = 0
     dropped_cargo_observation_memory: dict[Position, int] = field(default_factory=dict)
     stationary_enemy_observation_memory: dict[
@@ -473,8 +482,14 @@ class TacticMemory:
     enemy_core_memory: dict[str, EnemyCoreObservation] = field(default_factory=dict)
     enemy_core_revision: int = 0
     worker_routes: dict[str, WorkerRoute] = field(default_factory=dict)
+    planned_worker_destinations: dict[str, Position] = field(default_factory=dict)
+    worker_contested_positions: dict[str, dict[Position, int]] = field(
+        default_factory=dict
+    )
     cargo_recovery: dict[str, CargoRecovery] = field(default_factory=dict)
     route_diagnostics: dict[str, str] = field(default_factory=dict)
+    core_lane_departing_worker_id: str | None = None
+    core_lane_yield_worker_ids: set[str] = field(default_factory=set)
     core_observer_return_ids: set[str] = field(default_factory=set)
     raid: CoreRaidPlan = field(default_factory=CoreRaidPlan)
     guard_idle_assignments: int = 0
@@ -485,6 +500,8 @@ class TacticMemory:
 
         self.obstacle_memory.update(_positions(getattr(turn, "obstacle_cells", ())))
         tick = int(getattr(turn, "tick", 0))
+        previous_worker_destinations = self.planned_worker_destinations
+        self.planned_worker_destinations = {}
         self.last_observed_tick = tick
         self.route_diagnostics.clear()
         self.guard_idle_assignments = 0
@@ -502,8 +519,14 @@ class TacticMemory:
         for worker_key in set(self.worker_position_history) - living_worker_ids:
             self.worker_position_history.pop(worker_key, None)
             self.worker_routes.pop(worker_key, None)
+            self.worker_contested_positions.pop(worker_key, None)
             self.cargo_recovery.pop(worker_key, None)
             self.core_observer_return_ids.discard(worker_key)
+        if self.core_lane_departing_worker_id not in living_worker_ids:
+            self.core_lane_departing_worker_id = None
+            self.core_lane_yield_worker_ids.clear()
+        else:
+            self.core_lane_yield_worker_ids.intersection_update(living_worker_ids)
         friendly_ids = {
             str(getattr(unit, "id", ""))
             for unit in getattr(turn, "units", ())
@@ -541,16 +564,33 @@ class TacticMemory:
                     self.recent_attack_until_tick,
                     tick + RECENT_ATTACK_MEMORY_TICKS,
                 )
-            if event_type in {
-                "CORE_DESTROYED",
-                "CORE_LOST",
-                "CORE_RESOURCES_CAPTURED",
-            }:
+            own_core_destroyed = (
+                event_type == "CORE_DESTROYED"
+                and target_id in friendly_ids
+            )
+            if event_type == "CORE_LOST" or own_core_destroyed:
                 self.recovery_until_tick = max(self.recovery_until_tick, tick + 8)
             if event_type == "UNIT_MOVE_FAILED" and actor_id:
                 self.worker_routes.pop(actor_id, None)
                 self.route_diagnostics[actor_id] = reason_code or "MOVE_FAILED"
-            if event_type in {"CORE_DESTROYED", "CORE_LOST"} and target_id:
+                if reason_code == "MOVE_CONTESTED" and actor_id in living_worker_ids:
+                    contested_position = previous_worker_destinations.get(actor_id)
+                    if contested_position is None:
+                        contested_position = _position(getattr(event, "position", None))
+                    if contested_position is not None:
+                        contested = self.worker_contested_positions.setdefault(
+                            actor_id,
+                            {},
+                        )
+                        contested[contested_position] = max(
+                            contested.get(contested_position, 0),
+                            tick + MOVE_CONTESTED_AVOID_TICKS,
+                        )
+            if event_type in {
+                "CORE_DESTROYED",
+                "CORE_LOST",
+                "CORE_RESOURCES_CAPTURED",
+            } and target_id:
                 if target_id in self.enemy_core_memory:
                     self.enemy_core_memory.pop(target_id, None)
                     self.enemy_core_revision += 1
@@ -616,6 +656,10 @@ class TacticMemory:
                 continue
 
             visible_combat_ids.add(enemy_key)
+            remembered_danger = _enemy_danger_cells((enemy,), self.obstacle_memory)
+            remembered_danger.add(enemy_position)
+            for position in remembered_danger:
+                self.recent_combat_danger_positions[position] = tick
             self.threat_caution_until_tick = max(
                 self.threat_caution_until_tick,
                 tick + POST_THREAT_CAUTION_TICKS,
@@ -717,7 +761,12 @@ class TacticMemory:
             if motion.pursuit_score > 0
             and (
                 motion.core_distance <= CORE_EVADE_DISTANCE
-                or motion.pursuit_score >= DISTANT_PURSUIT_SCORE_THRESHOLD
+                or (
+                    motion.pursuit_score >= DISTANT_PURSUIT_SCORE_THRESHOLD
+                    and motion.ticks_to_attack_range is not None
+                    and motion.ticks_to_attack_range
+                    <= CORE_PREEMPTIVE_EVADE_HORIZON_TICKS
+                )
             )
             and tick - motion.last_tick < PURSUIT_MEMORY_TTL
         }
@@ -747,6 +796,17 @@ class TacticMemory:
         for position, observed_at in tuple(self.recent_attack_positions.items()):
             if tick - observed_at > RECENT_ATTACK_MEMORY_TICKS:
                 self.recent_attack_positions.pop(position, None)
+        for position, observed_at in tuple(
+            self.recent_combat_danger_positions.items()
+        ):
+            if tick - observed_at > RECENT_ATTACK_MEMORY_TICKS:
+                self.recent_combat_danger_positions.pop(position, None)
+        for worker_key, positions in tuple(self.worker_contested_positions.items()):
+            for position, expires_at in tuple(positions.items()):
+                if expires_at <= tick:
+                    positions.pop(position, None)
+            if not positions:
+                self.worker_contested_positions.pop(worker_key, None)
         for enemy_key, observation in tuple(
             self.stationary_enemy_observation_memory.items()
         ):
@@ -796,6 +856,32 @@ class TacticMemory:
 
     def recent_worker_positions(self, actor_id: Any) -> set[Position]:
         return set(self.worker_position_history.get(str(actor_id), ()))
+
+    def recent_worker_return_danger(self, tick: int) -> set[Position]:
+        danger = {
+            position
+            for position, observed_at in self.recent_combat_danger_positions.items()
+            if 0 <= tick - observed_at <= RECENT_ATTACK_MEMORY_TICKS
+        }
+        danger.update(
+            position
+            for position, observed_at in self.recent_attack_positions.items()
+            if 0 <= tick - observed_at <= RECENT_ATTACK_MEMORY_TICKS
+        )
+        return danger
+
+    def contested_worker_positions(self, actor_id: Any, tick: int) -> set[Position]:
+        return {
+            position
+            for position, expires_at in self.worker_contested_positions.get(
+                str(actor_id),
+                {},
+            ).items()
+            if expires_at > tick
+        }
+
+    def note_worker_move(self, actor_id: Any, destination: Position) -> None:
+        self.planned_worker_destinations[str(actor_id)] = destination
 
     def clear_resource_intent(self, actor_id: Any) -> None:
         key = str(actor_id)
@@ -1252,6 +1338,10 @@ def _trace_actor(actor: Any) -> dict[str, Any]:
 
 def _worker_mode(worker: Any, memory: TacticMemory, tick: int) -> str:
     worker_key = str(getattr(worker, "id", ""))
+    if worker_key == memory.core_lane_departing_worker_id:
+        return "CORE_CLEAR"
+    if worker_key in memory.core_lane_yield_worker_ids:
+        return "CARGO_YIELD"
     if int(getattr(worker, "cargo", 0)) > 0:
         return "CARGO_RETURN"
     if worker_key in memory.core_observer_return_ids:
@@ -1274,20 +1364,46 @@ def _event_label(event: Any) -> str:
 
 
 def _trace_event(event: Any) -> dict[str, Any]:
-    """Keep authoritative spawn prices while avoiding opaque event payloads."""
+    """Keep selected authoritative values while avoiding opaque event payloads."""
 
     event_name = _event_label(event)
     payload: dict[str, Any] = {"type": event_name}
     reason_code = getattr(event, "reason_code", None)
     if reason_code is not None:
         payload["reason_code"] = _enum_label(reason_code)
-    if event_name not in {"CORE_SPAWN_SUCCEEDED", "CORE_SPAWN_FAILED"}:
+    diagnostic_event = event_name in {
+        "UNIT_MOVE_FAILED",
+        "CORE_RESOURCES_CAPTURED",
+    } or any(
+        token in event_name
+        for token in ("DAMAGE", "DAMAGED", "DESTROY", "DROPPED", "HIT", "LOST")
+    )
+    if diagnostic_event:
+        actor_id = getattr(event, "actor_id", None)
+        target_id = getattr(event, "target_id", None)
+        position = _position(getattr(event, "position", None))
+        if actor_id is not None:
+            payload["actor_id"] = str(actor_id)
+        if target_id is not None:
+            payload["target_id"] = str(target_id)
+        if position is not None:
+            payload["position"] = _json_position(position)
+    selected_fields = {
+        "CORE_RESOURCES_CAPTURED": (
+            "amount",
+            "available",
+            "destroyed",
+            "capacity",
+        ),
+        "CORE_SPAWN_SUCCEEDED": ("unit_type", "cost", "required"),
+        "CORE_SPAWN_FAILED": ("unit_type", "cost", "required"),
+    }.get(event_name)
+    if selected_fields is None:
         return payload
 
     values = getattr(event, "values", None)
     if not isinstance(values, dict):
         return payload
-    selected_fields = ("unit_type", "cost", "required")
     selected_values = {
         field_name: values[field_name]
         for field_name in selected_fields
@@ -1512,6 +1628,21 @@ class SessionRecorder:
         }
         if memory.route_diagnostics:
             payload["route_anomalies"] = dict(sorted(memory.route_diagnostics.items()))
+        active_contested = {
+            worker_id: [
+                _json_position(position)
+                for position in sorted(
+                    memory.contested_worker_positions(worker_id, report.tick)
+                )
+            ]
+            for worker_id in sorted(memory.worker_contested_positions)
+            if memory.contested_worker_positions(worker_id, report.tick)
+        }
+        if active_contested:
+            payload["worker_contested_positions"] = active_contested
+        remembered_return_danger = memory.recent_worker_return_danger(report.tick)
+        if remembered_return_danger:
+            payload["worker_return_danger_count"] = len(remembered_return_danger)
         if memory.guard_idle_assignments:
             payload["guard_idle_assignments"] = memory.guard_idle_assignments
         if memory.raid_state_changed_tick == report.tick:
@@ -2106,11 +2237,154 @@ def _core_escape_direction(
     if not candidates:
         return None
     best_score, best_direction = max(candidates, key=lambda candidate: candidate[0])
-    if -best_score[0] > _projected_incoming_damage(
+    current_damage = _projected_incoming_damage(
         core_position,
         enemies,
         blocked,
-    ):
+    )
+    best_damage = -best_score[0]
+    if best_damage > current_damage:
+        return None
+    if best_damage == current_damage:
+        current_distances = tuple(
+            sorted(
+                _manhattan(core_position, enemy_position)
+                for enemy_position in enemy_positions
+            )
+        )
+        if best_score[1] < current_distances:
+            return None
+        if (
+            best_score[1] == current_distances
+            and best_direction != previous_direction
+        ):
+            return None
+    return best_direction
+
+
+def _worker_escape_direction(
+    worker_position: Position,
+    enemies: list[Any],
+    obstacles: set[Position],
+    hard_blocked: set[Position],
+    core_position: Position | None,
+    hp: int,
+) -> Direction | None:
+    """Choose a short escape path, allowing bounded fire-lane exposure."""
+
+    enemy_positions = {
+        position
+        for position in (_position(getattr(enemy, "position", None)) for enemy in enemies)
+        if position is not None
+    }
+    blocked = set(hard_blocked) | enemy_positions
+    blocked.discard(worker_position)
+    # Each frontier entry keeps one simple path; the search is intentionally
+    # tiny because only its first move is submitted this Tick.
+    frontier: list[tuple[Position, tuple[Direction, ...], frozenset[Position], int]] = [
+        (worker_position, (), frozenset({worker_position}), 0)
+    ]
+    safe_paths: list[
+        tuple[tuple[int, int, int, int, int, int, int, int], Direction]
+    ] = []
+    fallback_steps: list[tuple[tuple[int, int, int, int, int], Direction]] = []
+    health = max(1, hp)
+
+    for _ in range(WORKER_ESCAPE_SEARCH_DEPTH):
+        next_frontier = []
+        for position, path, visited, accumulated_damage in frontier:
+            for direction_index, direction in enumerate(CARDINAL_DIRECTIONS):
+                destination = _next_position(position, direction)
+                if destination in blocked or destination in visited:
+                    continue
+                projected_damage = _projected_incoming_damage(
+                    destination,
+                    enemies,
+                    obstacles,
+                )
+                new_path = path + (direction,)
+                new_damage = accumulated_damage + projected_damage
+                distances = [
+                    _manhattan(destination, enemy_position)
+                    for enemy_position in enemy_positions
+                ]
+                nearest_enemy = min(distances, default=PATH_COST_UNREACHABLE)
+                core_distance = (
+                    _manhattan(destination, core_position)
+                    if core_position is not None
+                    else 0
+                )
+                # Manhattan ties are common when both axes lead home. Reduce
+                # the dominant Core separation before using direction order.
+                core_axis_distance = (
+                    _chebyshev(destination, core_position)
+                    if core_position is not None
+                    else 0
+                )
+                first_direction = new_path[0]
+                first_index = CARDINAL_DIRECTIONS.index(first_direction)
+                first_damage = _projected_incoming_damage(
+                    _next_position(worker_position, first_direction),
+                    enemies,
+                    obstacles,
+                )
+
+                if len(new_path) == 1:
+                    fallback_steps.append(
+                        (
+                            (
+                                -projected_damage,
+                                nearest_enemy,
+                                -core_distance,
+                                -core_axis_distance,
+                                -direction_index,
+                            ),
+                            first_direction,
+                        )
+                    )
+                if projected_damage == 0:
+                    safe_paths.append(
+                        (
+                            (
+                                int(new_damage < health),
+                                -first_damage,
+                                -new_damage,
+                                -len(new_path),
+                                -core_distance,
+                                -core_axis_distance,
+                                nearest_enemy,
+                                -first_index,
+                            ),
+                            first_direction,
+                        )
+                    )
+                    continue
+                next_frontier.append(
+                    (
+                        destination,
+                        new_path,
+                        visited | {destination},
+                        new_damage,
+                    )
+                )
+        frontier = next_frontier
+        if not frontier:
+            break
+
+    if safe_paths:
+        return max(safe_paths, key=lambda candidate: candidate[0])[1]
+    if not fallback_steps:
+        return None
+    best_score, best_direction = max(
+        fallback_steps,
+        key=lambda candidate: candidate[0],
+    )
+    current_damage = _projected_incoming_damage(
+        worker_position,
+        enemies,
+        obstacles,
+    )
+    if -best_score[0] > current_damage:
         return None
     return best_direction
 
@@ -2171,6 +2445,7 @@ def _mission_state(
     enemies: list[Any],
     visible_resource_count: int,
     remembered_resource_count: int,
+    cargo_worker_count: int = 0,
 ) -> str:
     """Summarize the current subordinate mission without replacing facts."""
 
@@ -2178,7 +2453,7 @@ def _mission_state(
         return "RECOVERY"
     if threat.level in {"ALERT", "PRE_EVADE", "ENGAGED", "BREAKOUT"} or enemies:
         return "GUARD"
-    if visible_resource_count or remembered_resource_count:
+    if visible_resource_count or remembered_resource_count or cargo_worker_count:
         return "ECONOMY"
     return "SCOUT"
 
@@ -2586,6 +2861,13 @@ def _queue_worker_route(
         reservations,
         actor_origin=origin,
     )
+    route_blocked.discard(target)
+    contested_positions = memory.contested_worker_positions(
+        worker_id,
+        int(memory.last_observed_tick or 0),
+    )
+    route_blocked.update(contested_positions)
+    static_route_blocked = set(route_blocked)
     route_blocked.update(capacity_blocked)
     route_blocked.discard(target)
     discouraged = memory.recent_worker_positions(worker_id)
@@ -2608,15 +2890,27 @@ def _queue_worker_route(
             discouraged=discouraged,
         )
     elif status == "UNREACHABLE":
+        if capacity_blocked:
+            static_result = _complete_route(
+                origin,
+                target,
+                static_route_blocked,
+                discouraged=discouraged,
+            )
+            if static_result.status == "SUCCESS":
+                memory.route_diagnostics[worker_id] = "CAPACITY_BLOCKED"
+                return False, "CAPACITY_BLOCKED", result
         memory.route_diagnostics[worker_id] = "ROUTE_UNREACHABLE"
     if direction is None:
         return False, status, result
     destination = _next_position(origin, direction)
     if destination in capacity_blocked:
         memory.worker_routes.pop(worker_id, None)
+        memory.route_diagnostics[worker_id] = "CAPACITY_BLOCKED"
         return False, "CAPACITY_BLOCKED", result
     _reserve_destination(reservations, destination)
     worker.move(direction)
+    memory.note_worker_move(worker_id, destination)
     return True, status, result
 
 
@@ -3647,6 +3941,104 @@ def _resource_assignments(
     return result
 
 
+def _core_lane_outward_direction(
+    origin: Position,
+    core_position: Position,
+    blocked: set[Position],
+    reservations: Any,
+    friendly_occupancy: dict[Position, int],
+) -> Direction | None:
+    capacity_blocked = _unit_capacity_blocked(
+        friendly_occupancy,
+        reservations,
+        actor_origin=origin,
+    )
+    current_distance = _manhattan(origin, core_position)
+    candidates: list[tuple[tuple[int, int], Direction]] = []
+    for index, direction in enumerate(CARDINAL_DIRECTIONS):
+        destination = _next_position(origin, direction)
+        distance = _manhattan(destination, core_position)
+        if destination == core_position or distance <= current_distance:
+            continue
+        if destination in blocked or destination in capacity_blocked:
+            continue
+        candidates.append(((distance, -index), direction))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def _update_core_lane_clearance(
+    workers: list[Any],
+    core_position: Position | None,
+    worker_blocked: set[Position],
+    friendly_occupancy: dict[Position, int],
+    core_accepts_delivery: bool,
+    memory: TacticMemory,
+) -> None:
+    workers_by_id = {str(getattr(worker, "id", "")): worker for worker in workers}
+    if core_position is None or not core_accepts_delivery:
+        memory.core_lane_departing_worker_id = None
+        memory.core_lane_yield_worker_ids.clear()
+        return
+
+    departing_id = memory.core_lane_departing_worker_id
+    departing_worker = workers_by_id.get(departing_id) if departing_id else None
+    departing_position = _position(getattr(departing_worker, "position", None))
+    if (
+        departing_worker is None
+        or int(getattr(departing_worker, "cargo", 0)) > 0
+        or departing_position is None
+        or _manhattan(departing_position, core_position) > 1
+    ):
+        memory.core_lane_departing_worker_id = None
+        memory.core_lane_yield_worker_ids.clear()
+        departing_worker = None
+
+    exit_cells = {
+        _next_position(core_position, direction)
+        for direction in CARDINAL_DIRECTIONS
+        if _next_position(core_position, direction) not in worker_blocked
+    }
+    cargo_workers = [
+        worker for worker in workers if int(getattr(worker, "cargo", 0)) > 0
+    ]
+    if departing_worker is None and cargo_workers and exit_cells:
+        empty_core_workers = sorted(
+            (
+                worker
+                for worker in workers
+                if int(getattr(worker, "cargo", 0)) == 0
+                and _position(getattr(worker, "position", None)) == core_position
+            ),
+            key=lambda worker: str(getattr(worker, "id", "")),
+        )
+        blocking_cargo = [
+            worker
+            for worker in cargo_workers
+            if _position(getattr(worker, "position", None)) in exit_cells
+        ]
+        if empty_core_workers and blocking_cargo:
+            departing_worker = empty_core_workers[0]
+            departing_id = str(getattr(departing_worker, "id", ""))
+            memory.core_lane_departing_worker_id = departing_id
+            memory.core_lane_yield_worker_ids = {
+                str(getattr(worker, "id", "")) for worker in blocking_cargo
+            }
+            memory.clear_resource_intent(departing_id)
+            memory.worker_routes.pop(departing_id, None)
+
+    if departing_worker is None:
+        return
+    cargo_ids = {str(getattr(worker, "id", "")) for worker in cargo_workers}
+    memory.core_lane_yield_worker_ids.intersection_update(cargo_ids)
+    memory.core_lane_yield_worker_ids.update(
+        str(getattr(worker, "id", ""))
+        for worker in cargo_workers
+        if _position(getattr(worker, "position", None)) in exit_cells
+    )
+
+
 def _plan_workers(
     turn: Any,
     core: Any,
@@ -3658,6 +4050,7 @@ def _plan_workers(
     visible_enemies: list[Any],
     danger_cells: set[Position],
     friendly_occupancy: dict[Position, int],
+    core_will_move: bool = False,
 ) -> int:
     """Queue Worker actions and return resources delivered before Core acts."""
 
@@ -3675,9 +4068,14 @@ def _plan_workers(
         observation.position for observation in memory.enemy_core_memory.values()
     )
     worker_blocked = obstacles | danger_cells | enemy_occupied
+    worker_return_blocked = worker_blocked | memory.recent_worker_return_danger(tick)
     pending_delivery = 0
     delivery_space = _resource_space(turn)
-    core_accepts_delivery = core_position is not None and not _core_is_moving(core)
+    core_accepts_delivery = (
+        core_position is not None
+        and not _core_is_moving(core)
+        and not core_will_move
+    )
     current_resources = _positions(getattr(turn, "resource_cells", ()))
     remembered_resources = memory.recent_resource_targets(tick, resource_memory_ttl)
     dropped_cargo_resources = memory.recent_dropped_cargo_targets(
@@ -3716,6 +4114,17 @@ def _plan_workers(
                 previous_target,
                 worker_blocked,
             )
+            if (
+                route_cost >= PATH_COST_UNREACHABLE
+                and previous_target not in current_resources
+            ):
+                memory.resource_cooldowns[previous_target] = max(
+                    memory.resource_cooldowns.get(previous_target, 0),
+                    tick + RESOURCE_COOLDOWN_TICKS,
+                )
+                memory.forget_resource(previous_target)
+                memory.clear_resource_intent(worker_key)
+                continue
             memory.note_resource_progress(
                 worker_key,
                 previous_target,
@@ -3741,11 +4150,32 @@ def _plan_workers(
     reserved_destinations: dict[Position, int] = {}
     reserved_exploration_targets: set[Position] = set()
     reserved_exploration_vectors: set[int] = set()
+    _update_core_lane_clearance(
+        workers,
+        core_position,
+        worker_blocked,
+        friendly_occupancy,
+        core_accepts_delivery,
+        memory,
+    )
+    worker_slots = {
+        str(getattr(worker, "id", "")): slot for slot, worker in enumerate(workers)
+    }
+    planning_workers = sorted(
+        workers,
+        key=lambda worker: (
+            str(getattr(worker, "id", ""))
+            != memory.core_lane_departing_worker_id,
+            str(getattr(worker, "id", "")),
+        ),
+    )
 
-    for worker_slot, worker in enumerate(workers):
+    for worker in planning_workers:
         worker_position = _position(getattr(worker, "position", None))
         cargo = int(getattr(worker, "cargo", 0))
         worker_key = str(getattr(worker, "id", ""))
+        worker_slot = worker_slots[worker_key]
+        contested_positions = memory.contested_worker_positions(worker_key, tick)
 
         if worker_position is not None and combat_enemies:
             nearest_enemy_distance = min(
@@ -3763,18 +4193,23 @@ def _plan_workers(
                     and _manhattan(worker_position, core_position) > 3
                 ):
                     memory.begin_scout_return(worker_key, core_position)
-                direction = _core_escape_direction(
+                escape_blocked = (
+                    obstacles
+                    | enemy_occupied
+                    | contested_positions
+                    | _unit_capacity_blocked(
+                        friendly_occupancy,
+                        reserved_destinations,
+                        actor_origin=worker_position,
+                    )
+                )
+                direction = _worker_escape_direction(
                     worker_position,
                     combat_enemies,
-                    worker_blocked
-                    | {
-                        position
-                        for position, occupancy in friendly_occupancy.items()
-                        if occupancy
-                        + _reservation_count(reserved_destinations, position)
-                        >= 1
-                    },
-                    reserved_destinations,
+                    obstacles,
+                    escape_blocked,
+                    core_position,
+                    int(getattr(worker, "hp", 0)),
                 )
                 if direction is not None:
                     _reserve_destination(
@@ -3782,6 +4217,10 @@ def _plan_workers(
                         _next_position(worker_position, direction),
                     )
                     worker.move(direction)
+                    memory.note_worker_move(
+                        worker_key,
+                        _next_position(worker_position, direction),
+                    )
                     continue
                 if core_position is not None and worker_position != core_position:
                     moved, _, _ = _queue_worker_route(
@@ -3797,6 +4236,49 @@ def _plan_workers(
                         continue
                 worker.wait()
                 continue
+
+        if (
+            worker_key == memory.core_lane_departing_worker_id
+            and worker_position is not None
+            and core_position is not None
+        ):
+            direction = _core_lane_outward_direction(
+                worker_position,
+                core_position,
+                worker_blocked | contested_positions,
+                reserved_destinations,
+                friendly_occupancy,
+            )
+            if direction is not None:
+                destination = _next_position(worker_position, direction)
+                _reserve_destination(reserved_destinations, destination)
+                worker.move(direction)
+                memory.note_worker_move(worker_key, destination)
+            else:
+                worker.wait()
+            continue
+
+        if worker_key in memory.core_lane_yield_worker_ids:
+            if (
+                worker_position is not None
+                and core_position is not None
+                and _manhattan(worker_position, core_position) <= 1
+            ):
+                direction = _core_lane_outward_direction(
+                    worker_position,
+                    core_position,
+                    worker_blocked | contested_positions,
+                    reserved_destinations,
+                    friendly_occupancy,
+                )
+                if direction is not None:
+                    destination = _next_position(worker_position, direction)
+                    _reserve_destination(reserved_destinations, destination)
+                    worker.move(direction)
+                    memory.note_worker_move(worker_key, destination)
+                    continue
+            worker.wait()
+            continue
 
         if cargo > 0:
             recovery = memory.cargo_recovery.setdefault(worker_key, CargoRecovery())
@@ -3823,7 +4305,7 @@ def _plan_workers(
                         worker,
                         core_position,
                         "CARGO_RETURN",
-                        worker_blocked,
+                        worker_return_blocked,
                         reserved_destinations,
                         friendly_occupancy,
                         memory,
@@ -3836,7 +4318,7 @@ def _plan_workers(
                         recovery.target = _cargo_recovery_boundary(
                             route_result.explored if route_result is not None else (),
                             core_position,
-                            worker_blocked,
+                            worker_return_blocked,
                             memory.recent_worker_positions(worker_key),
                         )
                         recovery.selected_at_tick = tick
@@ -3848,7 +4330,7 @@ def _plan_workers(
                                 worker,
                                 recovery.target,
                                 "CARGO_RECOVERY",
-                                worker_blocked,
+                                worker_return_blocked,
                                 reserved_destinations,
                                 friendly_occupancy,
                                 memory,
@@ -3862,7 +4344,7 @@ def _plan_workers(
                         worker,
                         recovery.target,
                         "CARGO_RECOVERY",
-                        worker_blocked,
+                        worker_return_blocked,
                         reserved_destinations,
                         friendly_occupancy,
                         memory,
@@ -3874,7 +4356,7 @@ def _plan_workers(
                     worker,
                     core_position,
                     "CARGO_RETURN",
-                    worker_blocked,
+                    worker_return_blocked,
                     reserved_destinations,
                     friendly_occupancy,
                     memory,
@@ -3885,7 +4367,7 @@ def _plan_workers(
                         recovery.target = _cargo_recovery_boundary(
                             route_result.explored if route_result is not None else (),
                             core_position,
-                            worker_blocked,
+                            worker_return_blocked,
                             memory.recent_worker_positions(worker_key),
                         )
                         recovery.selected_at_tick = tick
@@ -3912,7 +4394,7 @@ def _plan_workers(
                     worker,
                     core_position,
                     "CORE_RECALL",
-                    worker_blocked,
+                    worker_return_blocked,
                     reserved_destinations,
                     friendly_occupancy,
                     memory,
@@ -3930,7 +4412,7 @@ def _plan_workers(
                     worker,
                     return_target,
                     "SCOUT_RETURN",
-                    worker_blocked,
+                    worker_return_blocked,
                     reserved_destinations,
                     friendly_occupancy,
                     memory,
@@ -4093,7 +4575,7 @@ def _plan_workers(
                     reserved_exploration_vectors.add(exploration_vector)
                 moved = True
                 break
-            if route_status == "BUDGET_EXCEEDED":
+            if route_status in {"BUDGET_EXCEEDED", "CAPACITY_BLOCKED"}:
                 break
             memory.advance_exploration(
                 worker.id,
@@ -4101,7 +4583,28 @@ def _plan_workers(
                 rotate=True,
             )
         if not moved:
-            worker.wait()
+            if worker_position == core_position:
+                direction = _core_lane_outward_direction(
+                    worker_position,
+                    core_position,
+                    worker_blocked | contested_positions,
+                    reserved_destinations,
+                    friendly_occupancy,
+                )
+                if direction is not None:
+                    destination = _next_position(worker_position, direction)
+                    memory.note_scout_progress(
+                        worker_key,
+                        destination,
+                        1,
+                        worker_position,
+                    )
+                    _reserve_destination(reserved_destinations, destination)
+                    worker.move(direction)
+                    memory.note_worker_move(worker_key, destination)
+                    moved = True
+            if not moved:
+                worker.wait()
 
     return pending_delivery
 
@@ -4379,8 +4882,7 @@ def _plan_rangers(
         ranger.wait()
 
 
-def _plan_core(
-    turn: Any,
+def _planned_core_move(
     core: Any,
     config: AgentConfig,
     blocked: set[Position],
@@ -4388,6 +4890,48 @@ def _plan_core(
     threat: ThreatAssessment,
     beacon_position: Position | None,
     memory: TacticMemory,
+) -> CoreMoveIntent | None:
+    if core is None or _core_is_moving(core):
+        return None
+    core_position = _position(getattr(core, "position", None))
+    if (
+        core_position is not None
+        and threat.level in {"PRE_EVADE", "ENGAGED", "BREAKOUT"}
+        and enemies
+    ):
+        direction = _core_escape_direction(
+            core_position,
+            enemies,
+            blocked,
+            previous_direction=memory.last_core_escape_direction,
+        )
+        if direction is not None:
+            return CoreMoveIntent(direction, remember_escape_direction=True)
+    if (
+        threat.level == "NORMAL"
+        and config.beacon_policy == "RETREAT"
+        and core_position is not None
+        and beacon_position is not None
+    ):
+        direction = _beacon_escape_direction(
+            core_position,
+            beacon_position,
+            blocked,
+        )
+        if direction is not None:
+            return CoreMoveIntent(direction)
+    return None
+
+
+def _plan_core(
+    turn: Any,
+    core: Any,
+    config: AgentConfig,
+    blocked: set[Position],
+    enemies: list[Any],
+    threat: ThreatAssessment,
+    memory: TacticMemory,
+    planned_move: CoreMoveIntent | None,
     pending_delivery: int = 0,
 ) -> None:
     if core is None:
@@ -4413,38 +4957,11 @@ def _plan_core(
         core.wait()
         return
 
-    core_position = _position(getattr(core, "position", None))
-    if (
-        core_position is not None
-        and threat.level in {"PRE_EVADE", "ENGAGED", "BREAKOUT"}
-        and enemies
-    ):
-        direction = _core_escape_direction(
-            core_position,
-            enemies,
-            blocked,
-            previous_direction=memory.last_core_escape_direction,
-        )
-        if direction is not None:
-            core.start_move(direction)
-            memory.last_core_escape_direction = direction
-            return
-
-    core_position = _position(getattr(core, "position", None))
-    if (
-        threat.level == "NORMAL"
-        and config.beacon_policy == "RETREAT"
-        and core_position is not None
-        and beacon_position is not None
-    ):
-        direction = _beacon_escape_direction(
-            core_position,
-            beacon_position,
-            blocked,
-        )
-        if direction is not None:
-            core.start_move(direction)
-            return
+    if planned_move is not None:
+        core.start_move(planned_move.direction)
+        if planned_move.remember_escape_direction:
+            memory.last_core_escape_direction = planned_move.direction
+        return
 
     resources = _available_resources(turn, pending_delivery)
     if int(getattr(core, "hp", 0)) < 4 and resources >= 1:
@@ -4570,6 +5087,15 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         threat,
         friendly_occupancy,
     )
+    planned_core_move = _planned_core_move(
+        core,
+        config,
+        blocked,
+        retreat_enemies,
+        threat,
+        beacon,
+        memory,
+    )
 
     pending_delivery = _plan_workers(
         turn,
@@ -4582,6 +5108,7 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         visible_enemies,
         danger_cells,
         friendly_occupancy,
+        core_will_move=planned_core_move is not None,
     )
     core_position = _position(getattr(core, "position", None))
     resource_cells = _positions(getattr(turn, "resource_cells", ()))
@@ -4685,8 +5212,8 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         blocked,
         retreat_enemies,
         threat,
-        beacon,
         memory,
+        planned_core_move,
         pending_delivery,
     )
 
@@ -4700,6 +5227,10 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         enemies,
         len(current_resources),
         len(remembered_resources),
+        sum(
+            int(getattr(worker, "cargo", 0)) > 0
+            for worker in getattr(turn, "workers", ())
+        ),
     )
 
     return PlanReport(

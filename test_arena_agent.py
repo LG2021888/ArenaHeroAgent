@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from arena_agent import (
     AgentConfig,
+    EnemyMotion,
     PlanReport,
     ScoutProgress,
     SessionRecorder,
@@ -17,6 +18,7 @@ from arena_agent import (
     IDLE_ASSIGNMENT_COST,
     PATH_COST_UNREACHABLE,
     ROUTE_MAX_EXPANSIONS,
+    MOVE_CONTESTED_AVOID_TICKS,
     CoreRaidPlan,
     EnemyCoreObservation,
     _assign_guard_posts,
@@ -24,6 +26,7 @@ from arena_agent import (
     _chebyshev_ring_positions,
     _cached_worker_route_step,
     _complete_route,
+    _core_escape_direction,
     _raid_target_durability,
     _render_turn,
     _estimated_path_cost,
@@ -35,7 +38,9 @@ from arena_agent import (
     _reconnect_delay,
     _save_tactic_memory,
     _submit_turn_with_retry,
+    _trace_event,
     _unit_cost,
+    _worker_escape_direction,
     choose_step_direction,
     plan_turn,
 )
@@ -386,6 +391,57 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertEqual(stats["accepted_ticks"], 1)
         self.assertEqual(stats["mission_counts"], {"SCOUT": 1})
 
+    def test_trace_event_keeps_move_failure_identity_and_position(self):
+        event = SimpleNamespace(
+            event_type="UNIT_MOVE_FAILED",
+            reason_code="MOVE_CONTESTED",
+            actor_id="worker",
+            target_id="enemy-worker",
+            position=(1, 0),
+        )
+
+        self.assertEqual(
+            _trace_event(event),
+            {
+                "type": "UNIT_MOVE_FAILED",
+                "reason_code": "MOVE_CONTESTED",
+                "actor_id": "worker",
+                "target_id": "enemy-worker",
+                "position": [1, 0],
+            },
+        )
+
+    def test_trace_event_keeps_core_resource_capture_details(self):
+        event = SimpleNamespace(
+            event_type="CORE_RESOURCES_CAPTURED",
+            reason_code=None,
+            actor_id="ranger",
+            target_id="enemy-core",
+            position=(8, 4),
+            values={
+                "amount": 7,
+                "available": 10,
+                "destroyed": 3,
+                "capacity": 7,
+            },
+        )
+
+        self.assertEqual(
+            _trace_event(event),
+            {
+                "type": "CORE_RESOURCES_CAPTURED",
+                "actor_id": "ranger",
+                "target_id": "enemy-core",
+                "position": [8, 4],
+                "values": {
+                    "amount": 7,
+                    "available": 10,
+                    "destroyed": 3,
+                    "capacity": 7,
+                },
+            },
+        )
+
     def test_only_initial_state_order_protocol_error_is_retryable(self):
         self.assertTrue(
             _is_retryable_protocol_error(ProtocolError("state arrived before tick"))
@@ -484,6 +540,18 @@ class ArenaAgentTests(unittest.TestCase):
         plan_turn(turn, TacticMemory(), AgentConfig(spawn_unit_type=None))
 
         self.assertEqual(worker.actions, [("DEPOSIT",)])
+
+    def test_cargo_return_is_reported_as_economy_mission(self):
+        worker = FakeActor("worker", (0, 1), cargo=1)
+        core = FakeActor("core", (0, 0))
+
+        report = plan_turn(
+            make_turn(worker=worker, core=core),
+            TacticMemory(),
+            AgentConfig(spawn_unit_type=None),
+        )
+
+        self.assertEqual(report.mission, "ECONOMY")
 
     def test_empty_worker_harvests_current_visible_resource(self):
         worker = FakeActor("worker", (3, 3), cargo=0)
@@ -700,6 +768,26 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertGreater(memory.resource_cooldowns[(4, 0)], 16)
         self.assertEqual(worker.actions[-1], ("MOVE", Direction.LEFT))
 
+    def test_unreachable_hidden_resource_is_forgotten_immediately(self):
+        worker = FakeActor("worker", (0, 0), cargo=0)
+        core = FakeActor("core", (10, 10))
+        target = (4, 0)
+        turn = make_turn(
+            worker=worker,
+            core=core,
+            obstacles=frozenset({target}),
+        )
+        memory = TacticMemory(
+            resource_observation_memory={target: turn.tick},
+            resource_intents={"worker": target},
+        )
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertNotIn("worker", memory.resource_intents)
+        self.assertNotIn(target, memory.resource_observation_memory)
+        self.assertGreater(memory.resource_cooldowns[target], turn.tick)
+
     def test_scout_changes_route_after_three_non_improving_path_ticks(self):
         worker = FakeActor("worker", (0, 0), cargo=0)
         core = FakeActor("core", (0, 0))
@@ -911,15 +999,43 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertEqual(report.mission, "RECOVERY")
 
     def test_core_loss_event_reports_recovery_lifecycle(self):
+        for event_type in ("CORE_LOST", "CORE_DESTROYED"):
+            with self.subTest(event_type=event_type):
+                core = FakeActor("core", (0, 0))
+                turn = make_turn(worker=None, core=core)
+                turn.events = (
+                    SimpleNamespace(
+                        event_type=event_type,
+                        reason_code=None,
+                        actor_id="enemy",
+                        target_id="core",
+                        position=(0, 0),
+                    ),
+                )
+
+                report = plan_turn(
+                    turn,
+                    TacticMemory(),
+                    AgentConfig(spawn_unit_type=None),
+                )
+
+                self.assertEqual(report.lifecycle, "RECOVERY")
+                self.assertEqual(report.mission, "RECOVERY")
+
+    def test_enemy_core_destroyed_event_does_not_report_recovery(self):
         core = FakeActor("core", (0, 0))
+        ranger = FakeActor("ranger", (8, 4), unit_type=UnitType.RANGER)
         turn = make_turn(worker=None, core=core)
+        turn.rangers = (ranger,)
+        turn.units = (ranger,)
+        turn.state.population = 1
         turn.events = (
             SimpleNamespace(
-                event_type="CORE_RESOURCES_CAPTURED",
+                event_type="CORE_DESTROYED",
                 reason_code=None,
-                actor_id="enemy",
-                target_id="core",
-                position=(0, 0),
+                actor_id="ranger",
+                target_id="enemy-core",
+                position=(8, 4),
             ),
         )
 
@@ -929,8 +1045,54 @@ class ArenaAgentTests(unittest.TestCase):
             AgentConfig(spawn_unit_type=None),
         )
 
-        self.assertEqual(report.lifecycle, "RECOVERY")
-        self.assertEqual(report.mission, "RECOVERY")
+        self.assertEqual(report.lifecycle, "ACTIVE")
+        self.assertNotEqual(report.mission, "RECOVERY")
+
+    def test_enemy_core_resource_capture_does_not_report_recovery(self):
+        core = FakeActor("core", (0, 0))
+        ranger = FakeActor("ranger", (8, 4), unit_type=UnitType.RANGER)
+        turn = make_turn(worker=None, core=core)
+        turn.rangers = (ranger,)
+        turn.units = (ranger,)
+        turn.state.population = 1
+        turn.events = (
+            SimpleNamespace(
+                event_type="CORE_RESOURCES_CAPTURED",
+                reason_code=None,
+                actor_id="ranger",
+                target_id="enemy-core",
+                position=(8, 4),
+                values={
+                    "amount": 7,
+                    "available": 10,
+                    "destroyed": 3,
+                    "capacity": 7,
+                },
+            ),
+        )
+        memory = TacticMemory(
+            enemy_core_memory={
+                "enemy-core": EnemyCoreObservation(
+                    id="enemy-core",
+                    position=(8, 4),
+                    hp=0,
+                    shield=0,
+                    state="NORMAL",
+                    last_seen_tick=turn.tick - 1,
+                )
+            }
+        )
+
+        report = plan_turn(
+            turn,
+            memory,
+            AgentConfig(spawn_unit_type=None),
+        )
+
+        self.assertEqual(report.lifecycle, "ACTIVE")
+        self.assertNotEqual(report.mission, "RECOVERY")
+        self.assertEqual(memory.recovery_until_tick, 0)
+        self.assertNotIn("enemy-core", memory.enemy_core_memory)
 
     def test_automatic_production_moves_to_vanguard_after_worker_target(self):
         workers = tuple(FakeActor(f"worker-{index}", (0, 0)) for index in range(12))
@@ -1125,6 +1287,29 @@ class ArenaAgentTests(unittest.TestCase):
 
         self.assertEqual(worker.actions, [("MOVE", Direction.UP)])
 
+    def test_worker_crosses_one_ranger_danger_cell_to_escape_firing_lane(self):
+        worker = FakeActor("worker", (0, 1), cargo=0)
+        core = FakeActor("core", (-10, -1))
+        enemy = FakeActor("enemy", (0, 0), unit_type=UnitType.RANGER)
+        turn = make_turn(
+            worker=worker,
+            core=core,
+            enemies=(enemy,),
+            obstacles=frozenset({(0, -1), (1, 1)}),
+        )
+        memory = TacticMemory()
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(worker.actions, [("MOVE", Direction.LEFT)])
+
+        worker.actions.clear()
+        worker.position = (-1, 1)
+        turn.tick += 1
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(worker.actions, [("MOVE", Direction.LEFT)])
+
     def test_evading_scout_returns_to_core_before_resuming_exploration(self):
         worker = FakeActor("worker", (6, 0), cargo=0)
         core = FakeActor("core", (0, 0))
@@ -1162,6 +1347,47 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertNotIn("worker", memory.scout_return_targets)
         self.assertEqual(worker.actions, [("WAIT",)])
         self.assertEqual(memory.scout_progress["worker"].path_stalled_turns, 0)
+
+    def test_scout_return_avoids_recent_combat_danger_after_enemy_disappears(self):
+        worker = FakeActor("worker", (6, 0), cargo=0)
+        core = FakeActor("core", (0, 0))
+        enemy = FakeActor("enemy", (5, 1), unit_type=UnitType.VANGUARD)
+        turn = make_turn(worker=worker, core=core, enemies=(enemy,))
+        memory = TacticMemory()
+        config = AgentConfig(spawn_unit_type=None)
+
+        plan_turn(turn, memory, config)
+
+        self.assertEqual(memory.scout_return_targets["worker"], (0, 0))
+        self.assertIn((5, 0), memory.recent_worker_return_danger(turn.tick))
+
+        worker.actions.clear()
+        turn.tick += 1
+        turn.visible_enemies = ()
+        plan_turn(turn, memory, config)
+
+        self.assertEqual(worker.actions[0][0], "MOVE")
+        self.assertNotEqual(worker.actions[0][1], Direction.LEFT)
+
+        worker.actions.clear()
+        turn.tick = 10 + 6 + 1
+        memory.worker_routes.clear()
+        plan_turn(turn, memory, config)
+
+        self.assertEqual(memory.recent_worker_return_danger(turn.tick), set())
+        self.assertEqual(worker.actions, [("MOVE", Direction.LEFT)])
+
+    def test_enemy_worker_alone_does_not_create_return_danger(self):
+        worker = FakeActor("worker", (6, 0), cargo=0)
+        core = FakeActor("core", (0, 0))
+        enemy = FakeActor("enemy-worker", (5, 1), unit_type=UnitType.WORKER)
+        turn = make_turn(worker=worker, core=core, enemies=(enemy,))
+        memory = TacticMemory()
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertNotIn("worker", memory.scout_return_targets)
+        self.assertEqual(memory.recent_worker_return_danger(turn.tick), set())
 
     def test_own_attack_does_not_enter_engaged_threat_state(self):
         worker = FakeActor("worker", (0, 0))
@@ -1235,6 +1461,80 @@ class ArenaAgentTests(unittest.TestCase):
 
         self.assertEqual(report.threat_level, "PRE_EVADE")
         self.assertEqual(core.actions[0][0], "START_MOVE")
+
+    def test_distant_pursuer_outside_horizon_does_not_move_core(self):
+        core = FakeActor("core", (0, 0))
+        core.hp = 5
+        enemy = FakeActor("enemy", (50, 0), unit_type=UnitType.RANGER)
+        turn = make_turn(worker=None, core=core, enemies=(enemy,))
+        memory = TacticMemory()
+        config = AgentConfig(spawn_unit_type=None)
+
+        for tick, enemy_x in ((10, 50), (11, 49), (12, 48)):
+            turn.tick = tick
+            enemy.position = (enemy_x, 0)
+            core.actions.clear()
+            report = plan_turn(turn, memory, config)
+
+        self.assertEqual(report.threat_level, "ALERT")
+        self.assertEqual(core.actions, [("WAIT",)])
+
+    def test_core_escape_does_not_step_toward_threat_in_dead_end(self):
+        enemy = FakeActor("enemy", (-10, 0), unit_type=UnitType.VANGUARD)
+
+        direction = _core_escape_direction(
+            (0, 0),
+            [enemy],
+            {(0, -1), (1, 0), (0, 1)},
+        )
+
+        self.assertIsNone(direction)
+
+    def test_worker_escape_prefers_core_when_safe_directions_tie(self):
+        worker_position = (-178, 649)
+        core_position = (-217, 664)
+        enemy = FakeActor("enemy", (-175, 649), unit_type=UnitType.RANGER)
+        obstacles = {(-178, 648)}
+
+        direction = _worker_escape_direction(
+            worker_position,
+            [enemy],
+            obstacles,
+            obstacles,
+            core_position,
+            2,
+        )
+
+        self.assertEqual(direction, Direction.LEFT)
+
+    def test_core_move_start_suppresses_same_tick_worker_deposit(self):
+        worker = FakeActor("worker", (0, 0), cargo=1)
+        core = FakeActor("core", (0, 0))
+        core.hp = 5
+        turn = make_turn(worker=worker, core=core)
+        memory = TacticMemory(
+            enemy_motion_memory={
+                "enemy": EnemyMotion(
+                    position=(3, 0),
+                    last_tick=10,
+                    core_distance=3,
+                    unit_type=UnitType.VANGUARD,
+                    pursuit_score=4,
+                    activity_until_tick=10,
+                    ticks_to_attack_range=2,
+                )
+            }
+        )
+
+        report = plan_turn(
+            turn,
+            memory,
+            AgentConfig(spawn_unit_type=None),
+        )
+
+        self.assertEqual(worker.actions, [("WAIT",)])
+        self.assertEqual(core.actions[0][0], "START_MOVE")
+        self.assertEqual(report.pending_delivery, 0)
 
     def test_enemy_worker_does_not_trigger_worker_or_core_retreat(self):
         worker = FakeActor("worker", (6, 0), cargo=0)
@@ -1330,7 +1630,7 @@ class ArenaAgentTests(unittest.TestCase):
             AgentConfig(spawn_unit_type=None),
         )
 
-        self.assertEqual(worker.actions, [("MOVE", Direction.UP)])
+        self.assertEqual(worker.actions, [("MOVE", Direction.RIGHT)])
 
     def test_core_emergency_spawns_vanguard_when_escape_is_blocked(self):
         core = FakeActor("core", (0, 0))
@@ -1607,6 +1907,47 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertNotEqual(third_direction, Direction.RIGHT)
         self.assertIsNotNone(third_result)
 
+    def test_move_contested_temporarily_routes_worker_around_destination(self):
+        worker = FakeActor("worker", (0, 0), cargo=1)
+        core = FakeActor("core", (3, 0))
+        core.hp = 5
+        turn = make_turn(worker=worker, core=core)
+        memory = TacticMemory()
+        config = AgentConfig(spawn_unit_type=None)
+
+        plan_turn(turn, memory, config)
+
+        self.assertEqual(worker.actions, [("MOVE", Direction.RIGHT)])
+        self.assertEqual(memory.planned_worker_destinations["worker"], (1, 0))
+
+        worker.actions.clear()
+        turn.tick += 1
+        turn.events = (
+            SimpleNamespace(
+                event_type="UNIT_MOVE_FAILED",
+                reason_code="MOVE_CONTESTED",
+                actor_id="worker",
+                target_id="enemy-worker",
+                position=None,
+            ),
+        )
+        plan_turn(turn, memory, config)
+
+        self.assertNotEqual(worker.actions, [("MOVE", Direction.RIGHT)])
+        self.assertEqual(
+            memory.contested_worker_positions("worker", turn.tick),
+            {(1, 0)},
+        )
+
+        worker.actions.clear()
+        turn.tick += MOVE_CONTESTED_AVOID_TICKS
+        turn.events = ()
+        memory.worker_routes.clear()
+        plan_turn(turn, memory, config)
+
+        self.assertEqual(memory.contested_worker_positions("worker", turn.tick), set())
+        self.assertEqual(worker.actions, [("MOVE", Direction.RIGHT)])
+
     def test_visible_enemy_core_and_worker_cells_block_cargo_return(self):
         for enemy in (
             SimpleNamespace(
@@ -1629,6 +1970,51 @@ class ArenaAgentTests(unittest.TestCase):
                 self.assertTrue(worker.actions)
                 self.assertEqual(worker.actions[0][0], "MOVE")
                 self.assertNotEqual(worker.actions[0][1], Direction.UP)
+
+    def test_capacity_blocked_overwrites_route_budget_diagnostic(self):
+        worker = FakeActor("worker", (0, 1), cargo=1)
+        core = FakeActor("core", (0, 0))
+        core.hp = 5
+        guard = FakeActor("guard", (0, 0), unit_type=UnitType.VANGUARD)
+        turn = make_turn(worker=worker, core=core)
+        turn.vanguards = (guard,)
+        turn.units = (worker, guard)
+        turn.state.population = 2
+        memory = TacticMemory()
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(worker.actions, [("WAIT",)])
+        self.assertEqual(memory.route_diagnostics["worker"], "CAPACITY_BLOCKED")
+
+    def test_critical_cargo_return_avoids_recent_combat_danger(self):
+        worker = FakeActor("worker", (2, 0), cargo=1)
+        worker.hp = 1
+        core = FakeActor("core", (-1, 0))
+        core.hp = 5
+        turn = make_turn(worker=worker, core=core)
+        memory = TacticMemory(recent_combat_danger_positions={(1, 0): turn.tick})
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(worker.actions[0][0], "MOVE")
+        self.assertNotEqual(worker.actions[0][1], Direction.LEFT)
+
+    def test_critical_cargo_return_waits_when_only_exit_is_recent_danger(self):
+        worker = FakeActor("worker", (1, 0), cargo=1)
+        worker.hp = 1
+        core = FakeActor("core", (-1, 0))
+        core.hp = 5
+        turn = make_turn(
+            worker=worker,
+            core=core,
+            obstacles=frozenset({(1, -1), (2, 0), (1, 1)}),
+        )
+        memory = TacticMemory(recent_combat_danger_positions={(0, 0): turn.tick})
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(worker.actions, [("WAIT",)])
 
     def test_real_enemy_occupied_cells_are_never_selected_for_return(self):
         scenarios = (
@@ -1830,6 +2216,117 @@ class ArenaAgentTests(unittest.TestCase):
         plan_turn(turn, TacticMemory(), AgentConfig(spawn_unit_type=None))
 
         self.assertEqual(worker.actions, [("WAIT",)])
+
+    def test_single_entrance_core_lane_clears_for_waiting_cargo(self):
+        cargo = FakeActor("a-cargo", (-1, 0), cargo=1)
+        empty = FakeActor("b-empty", (0, 0), cargo=0)
+        core = FakeActor("core", (0, 0))
+        core.hp = 5
+        turn = make_turn(
+            worker=empty,
+            core=core,
+            obstacles=frozenset({(0, -1), (1, 0), (0, 1)}),
+        )
+        turn.workers = (cargo, empty)
+        turn.units = (cargo, empty)
+        turn.state.population = 2
+        memory = TacticMemory()
+        config = AgentConfig(spawn_unit_type=None)
+
+        plan_turn(turn, memory, config)
+
+        self.assertEqual(cargo.actions, [("MOVE", Direction.UP)])
+        self.assertEqual(empty.actions, [("WAIT",)])
+
+        cargo.position = (-1, -1)
+        cargo.actions.clear()
+        empty.actions.clear()
+        turn.tick += 1
+        plan_turn(turn, memory, config)
+
+        self.assertEqual(cargo.actions, [("WAIT",)])
+        self.assertEqual(empty.actions, [("MOVE", Direction.LEFT)])
+
+        empty.position = (-1, 0)
+        cargo.actions.clear()
+        empty.actions.clear()
+        turn.tick += 1
+        plan_turn(turn, memory, config)
+
+        self.assertEqual(cargo.actions, [("WAIT",)])
+        self.assertEqual(empty.actions, [("MOVE", Direction.DOWN)])
+
+        empty.position = (-1, 1)
+        cargo.actions.clear()
+        empty.actions.clear()
+        turn.tick += 1
+        plan_turn(turn, memory, config)
+        self.assertEqual(cargo.actions, [("MOVE", Direction.DOWN)])
+
+        cargo.position = (-1, 0)
+        cargo.actions.clear()
+        empty.actions.clear()
+        turn.tick += 1
+        plan_turn(turn, memory, config)
+        self.assertEqual(cargo.actions, [("MOVE", Direction.RIGHT)])
+
+        cargo.position = (0, 0)
+        cargo.actions.clear()
+        empty.actions.clear()
+        turn.tick += 1
+        plan_turn(turn, memory, config)
+        self.assertEqual(cargo.actions, [("DEPOSIT",)])
+
+    def test_occupied_core_clears_even_when_another_exit_is_free(self):
+        cargo = FakeActor("a-cargo", (0, 1), cargo=1)
+        empty = FakeActor("b-empty", (0, 0), cargo=0)
+        core = FakeActor("core", (0, 0))
+        core.hp = 5
+        turn = make_turn(worker=empty, core=core)
+        turn.workers = (cargo, empty)
+        turn.units = (cargo, empty)
+        turn.state.population = 2
+        memory = TacticMemory()
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(memory.core_lane_departing_worker_id, "b-empty")
+        self.assertEqual(empty.actions, [("MOVE", Direction.UP)])
+
+    def test_idle_core_worker_egresses_as_scout_when_frontier_is_unreachable(self):
+        worker = FakeActor("worker", (0, 0), cargo=0)
+        core = FakeActor("core", (0, 0))
+        core.hp = 5
+        obstacles = frozenset(
+            {(0, -1), (1, 0), (0, 1), (-1, -1), (-2, 0), (-1, 1)}
+        )
+        turn = make_turn(worker=worker, core=core, obstacles=obstacles)
+        memory = TacticMemory()
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(worker.actions, [("MOVE", Direction.LEFT)])
+        self.assertEqual(memory.scout_progress["worker"].target, (-1, 0))
+
+    def test_capacity_blocked_scout_keeps_its_assignment(self):
+        worker = FakeActor("worker", (0, 0), cargo=0)
+        core = FakeActor("core", (10, 10))
+        core.hp = 5
+        blockers = tuple(
+            FakeActor(f"guard-{index}", position, unit_type=UnitType.VANGUARD)
+            for index, position in enumerate(((0, -1), (1, 0), (0, 1), (-1, 0)))
+        )
+        turn = make_turn(worker=worker, core=core)
+        turn.vanguards = blockers
+        turn.units = (worker,) + blockers
+        turn.state.population = len(turn.units)
+        memory = TacticMemory()
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(worker.actions, [("WAIT",)])
+        self.assertIn("worker", memory.scout_progress)
+        self.assertEqual(memory.route_diagnostics["worker"], "CAPACITY_BLOCKED")
 
     def test_distant_cargo_approaches_an_occupied_core_before_queueing(self):
         worker = FakeActor("worker", (0, 2), cargo=1)
