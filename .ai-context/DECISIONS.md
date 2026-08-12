@@ -124,3 +124,74 @@ Only decisions with direct repository or runtime evidence are recorded here.
   stops ordinary production at 30 even though game prices continue upward.
 - **Evidence:** Defaults and production logic in `arena_agent.py`, runtime
   configuration, README, and expansion/reserve/price tests.
+
+## 2026-08-12 - Make Post-Target Population Expansion Optional And Resource-Gated
+
+- **Decision:** Supersede the fixed 30-Unit strategy stop with an independent
+  optional expansion switch. Keep `16/6/8` as configured targets, then grow
+  toward the `8:3:4` ratio only when available resources reach
+  `max(configured_floor, capacity - 5 * casualty_buffer_units)`. Use 150 as
+  the current base floor, 6 Units as the casualty buffer, and
+  `max_population=0` for no strategy hard cap.
+- **Reason:** A fixed 30-Unit stop allowed resources to approach capacity and
+  stop flowing. Resource-gated production spends surplus while preserving a
+  150-resource operating base and enough capacity headroom to avoid additional
+  overflow loss after a plausible six-Unit casualty event.
+- **Rejected alternative:** Keep production permanently disabled at 30, grow
+  on a percentage-only threshold, or add unlimited Workers without preserving
+  the combat ratio.
+- **Impact:** Configured losses are still repaired before optional growth.
+  Expansion naturally slows as dynamic prices rise, can be disabled without
+  changing roster targets, and still honors an explicitly configured finite
+  hard cap.
+- **Evidence:** Commit `cf67056`, `_population_expansion_threshold`,
+  `_proportional_expansion_unit`, `_choose_spawn_unit`, CLI/environment
+  configuration, README, expansion tests, and the live startup message
+  `Population expansion=ON(threshold=150,casualty_buffer=6)`.
+
+## 2026-08-12 - Separate Closed-Pocket Recovery From Single-Entrance Throughput
+
+- **Decision:** Use two related but distinct Core-logistics mechanisms. A
+  debounced bounded-component detector and local bridge handle a genuinely
+  closed Core pocket. A half-duplex Cargo lane handles an open Core with only
+  one usable entrance: evacuate accumulated empty Workers, admit one Cargo
+  owner, deposit, require complete egress into an open dynamic component, then
+  admit the next owner.
+- **Reason:** Runtime geometry showed both failure modes. Tick 89475 had a
+  closed nine-cell Core component with seven Cargo outside; Tick 93715 had an
+  open component but only the right-side entrance, so inbound and outbound
+  Workers blocked each other. Pocket size alone also misclassified normal
+  delivery, requiring admitted-Cargo flow evidence and debounce.
+- **Rejected alternative:** Increase A* budget, use one-step movement away
+  from Core as egress, treat every small Core component as blocked, or allow
+  the next owner in as soon as the old owner leaves the Core cell.
+- **Impact:** Lane phases and reservations serialize startup evacuation,
+  inbound delivery, deposit, and egress. Dead side pockets do not count as
+  departure, staging Cargo cannot enter early, and active lane reservations
+  cannot recursively trigger `CORE_POCKET_BLOCKED`.
+- **Evidence:** Commit `0769085`, `CorePocketStatus`, `CargoLanePlan`,
+  `_update_core_pocket`, `_update_cargo_lane`, Tick 89304/89475/93715
+  regression fixtures, all 157 tests, and the live Tick 93977-93983
+  deposit/egress/next-owner sequence.
+
+## 2026-08-12 - Close The Combat Movement Feedback Loop
+
+- **Decision:** Treat visible enemy-occupied cells as hard movement blockers,
+  apply authoritative move-failure feedback to all Unit types, and cool a
+  stationary-clear target after repeated failed approaches. Critically wounded
+  Vanguards and Rangers attempt a strictly safer legal movement before normal
+  attack or guard behavior and may return for healing when supported.
+- **Reason:** A Vanguard previously submitted a failed move toward an
+  enemy-occupied Core cell on every Tick for 284 Ticks because command
+  submission was mistaken for movement success and Worker-only feedback did
+  not teach combat Units. Separately, a low-HP Defender could attack again
+  while standing in lethal projected fire.
+- **Rejected alternative:** Rely on enemies eventually moving, raise path
+  budgets, or attach retry cooldown only to local planning success.
+- **Impact:** Server `UNIT_MOVE_FAILED` events temporarily block the actual
+  failed destination for the actor, repeated stationary cleanup changes
+  target, and critical retreat has priority only when it finds a lower-damage
+  legal cell, preserving attacks when no safer move exists.
+- **Evidence:** Commits `cf67056` and `0769085`, combat move-failure memory and
+  stationary-clear cooldowns in `arena_agent.py`, historical enemy-Core
+  occupancy tests, damaged-defender tests, and the full 157-test suite.
