@@ -30,6 +30,7 @@ from arena_agent import (
     _choose_spawn_unit,
     _complete_route,
     _cargo_lane_egress_complete,
+    _cargo_lane_egress_route,
     _cargo_lane_startup_workers,
     _core_escape_direction,
     _friendly_cell_occupancy,
@@ -3176,6 +3177,91 @@ class ArenaAgentTests(unittest.TestCase):
                 {(4, 0): 1},
             )
         )
+
+    def test_cargo_lane_egress_route_survives_temporary_friendly_blockers(self):
+        lane = CargoLanePlan(
+            active=True,
+            phase="EGRESS",
+            core_position=(0, 0),
+            departing_worker_id="departing",
+            path=((0, 0), (1, 0), (2, 0), (3, 0)),
+            gateway=(3, 0),
+        )
+        blocked = {(0, -1), (-1, 0), (0, 1)}
+        friendly_occupancy = {
+            (0, 0): 1,
+            (1, 0): 1,
+            (2, 0): 1,
+            (3, 0): 1,
+            (4, 0): 1,
+        }
+
+        route = _cargo_lane_egress_route(
+            (0, 0),
+            lane,
+            blocked,
+            friendly_occupancy,
+        )
+
+        self.assertIsNotNone(route)
+        self.assertEqual(route[:4], lane.path)
+        self.assertEqual(route[-1], (4, 0))
+
+    def test_cargo_lane_egress_clears_friendly_occupied_corridor(self):
+        departing = FakeActor("departing", (0, 0), cargo=0)
+        blockers = (
+            FakeActor("blocker-1", (1, 0), cargo=0),
+            FakeActor("blocker-2", (2, 0), cargo=1),
+            FakeActor("blocker-3", (3, 0), cargo=1),
+            FakeActor("blocker-4", (4, 0), cargo=1),
+        )
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        turn = make_turn(
+            worker=departing,
+            core=core,
+            obstacles=frozenset({(0, -1), (-1, 0), (0, 1)}),
+        )
+        turn.workers = (departing,) + blockers
+        turn.units = turn.workers
+        turn.state.population = len(turn.units)
+        memory = TacticMemory(
+            cargo_lane=CargoLanePlan(
+                active=True,
+                phase="EGRESS",
+                core_position=(0, 0),
+                departing_worker_id="departing",
+                path=((0, 0), (1, 0), (2, 0), (3, 0)),
+                gateway=(3, 0),
+                started_tick=turn.tick - 1,
+                last_planned_tick=turn.tick - 1,
+            )
+        )
+        history = []
+
+        for _ in range(16):
+            plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+            history.append(
+                (
+                    turn.tick,
+                    memory.cargo_lane.phase,
+                    memory.cargo_lane.departing_worker_id,
+                    departing.position,
+                    tuple(sorted(memory.cargo_lane.yield_worker_ids)),
+                    memory.cargo_lane.owner_id,
+                )
+            )
+            apply_synchronous_actions(turn)
+            if memory.cargo_lane.departing_worker_id is None:
+                break
+
+        self.assertIsNone(memory.cargo_lane.departing_worker_id, f"history={history}")
+        self.assertGreaterEqual(departing.position[0], 4, f"history={history}")
+        self.assertTrue(
+            any(row[4] for row in history),
+            f"no blocker entered CARGO_LANE_YIELD: history={history}",
+        )
+        self.assertIsNotNone(memory.cargo_lane.owner_id, f"history={history}")
 
     def test_tick_93715_detects_right_lane_and_seven_startup_workers(self):
         core_position = (-217, 666)

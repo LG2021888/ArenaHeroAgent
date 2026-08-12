@@ -3731,12 +3731,14 @@ def _cargo_lane_egress_route(
 ) -> tuple[Position, ...] | None:
     if lane.core_position is None or lane.gateway is None:
         return None
-    dynamic_blocked = set(blocked) | set(friendly_occupancy)
-    dynamic_blocked.discard(start)
-    to_gateway = _complete_route(start, lane.gateway, dynamic_blocked)
+    # Plan through temporary friendly occupancy so the lane controller can
+    # mark those Units for yielding. Actual movement still enforces capacity.
+    route_blocked = set(blocked)
+    route_blocked.discard(start)
+    to_gateway = _complete_route(start, lane.gateway, route_blocked)
     if to_gateway.status != "SUCCESS":
         return None
-    outward_blocked = set(blocked) | set(friendly_occupancy) | set(lane.path)
+    outward_blocked = set(blocked) | set(lane.path)
     outward_blocked.discard(lane.gateway)
     outward = _cargo_lane_open_route(
         lane.gateway,
