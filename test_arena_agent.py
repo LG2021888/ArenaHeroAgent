@@ -1676,6 +1676,140 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertEqual(report.threat_level, "ENGAGED")
         self.assertEqual(core.actions, [("WAIT",)])
 
+    def test_distant_worker_attack_does_not_escalate_core_or_clear_cargo_lane(self):
+        cargo = FakeActor("cargo", (2, 0), cargo=1)
+        scout = FakeActor("scout", (45, 0), cargo=0)
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        enemies = (
+            FakeActor("enemy-1", (45, 1), unit_type=UnitType.RANGER),
+            FakeActor("enemy-2", (46, 0), unit_type=UnitType.RANGER),
+            FakeActor("enemy-3", (46, 1), unit_type=UnitType.RANGER),
+        )
+        event = SimpleNamespace(
+            event_type="UNIT_DAMAGED",
+            reason_code="ATTACK",
+            actor_id=None,
+            target_id="scout",
+            position=(45, 0),
+        )
+        turn = make_turn(worker=cargo, core=core, enemies=enemies)
+        turn.workers = (cargo, scout)
+        turn.units = (cargo, scout)
+        turn.events = (event,)
+        turn.state.population = 2
+        memory = TacticMemory(
+            cargo_lane=CargoLanePlan(
+                active=True,
+                phase="INBOUND",
+                core_position=(0, 0),
+                owner_id="cargo",
+                path=((0, 0), (1, 0), (2, 0), (3, 0)),
+                gateway=(3, 0),
+                started_tick=turn.tick - 1,
+                last_planned_tick=turn.tick - 1,
+            )
+        )
+
+        report = plan_turn(
+            turn,
+            memory,
+            AgentConfig(spawn_unit_type=None),
+        )
+
+        self.assertEqual(report.threat_level, "NORMAL")
+        self.assertEqual(report.threat_reason, "NONE")
+        self.assertEqual(report.mission, "ECONOMY")
+        self.assertTrue(memory.cargo_lane.active)
+        self.assertEqual(memory.cargo_lane.owner_id, "cargo")
+        self.assertFalse(any(action[0] == "START_MOVE" for action in core.actions))
+        self.assertIn((45, 0), memory.recent_worker_return_danger(turn.tick))
+        self.assertEqual(memory.scout_return_targets["scout"], (0, 0))
+
+    def test_recent_attack_inside_alert_range_does_not_move_core(self):
+        worker = FakeActor("worker", (10, 0), cargo=0)
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        enemy = FakeActor("enemy", (11, 0), unit_type=UnitType.RANGER)
+        event = SimpleNamespace(
+            event_type="UNIT_DAMAGED",
+            reason_code="ATTACK",
+            actor_id=None,
+            target_id="worker",
+            position=(10, 0),
+        )
+        turn = make_turn(worker=worker, core=core, enemies=(enemy,))
+        turn.events = (event,)
+
+        report = plan_turn(
+            turn,
+            TacticMemory(),
+            AgentConfig(spawn_unit_type=None),
+        )
+
+        self.assertEqual(report.threat_level, "ALERT")
+        self.assertEqual(report.threat_reason, "RECENT_ATTACK")
+        self.assertFalse(any(action[0] == "START_MOVE" for action in core.actions))
+
+    def test_recent_attack_inside_evade_range_still_moves_core(self):
+        worker = FakeActor("worker", (7, 0), cargo=0)
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        enemy = FakeActor("enemy", (8, 0), unit_type=UnitType.RANGER)
+        event = SimpleNamespace(
+            event_type="UNIT_DAMAGED",
+            reason_code="ATTACK",
+            actor_id=None,
+            target_id="worker",
+            position=(7, 0),
+        )
+        turn = make_turn(worker=worker, core=core, enemies=(enemy,))
+        turn.events = (event,)
+
+        report = plan_turn(
+            turn,
+            TacticMemory(),
+            AgentConfig(spawn_unit_type=None),
+        )
+
+        self.assertEqual(report.threat_level, "ENGAGED")
+        self.assertEqual(report.threat_reason, "RECENT_ATTACK")
+        self.assertEqual(core.actions[0][0], "START_MOVE")
+        self.assertNotEqual(core.actions[0][1], Direction.RIGHT)
+
+    def test_recent_attack_distance_drives_emergency_spawn_with_only_far_enemy(self):
+        worker = FakeActor("worker", (5, 0), cargo=0)
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        enemy = FakeActor("enemy", (20, 0), unit_type=UnitType.RANGER)
+        event = SimpleNamespace(
+            event_type="UNIT_DAMAGED",
+            reason_code="ATTACK",
+            actor_id=None,
+            target_id="worker",
+            position=(5, 0),
+        )
+        turn = make_turn(
+            worker=worker,
+            core=core,
+            enemies=(enemy,),
+            obstacles=frozenset({(0, -1), (1, 0), (0, 1), (-1, 0)}),
+        )
+        turn.events = (event,)
+        turn.resources = 12
+        turn.resource_capacity = 20
+        turn.state.population = 1
+
+        report = plan_turn(
+            turn,
+            TacticMemory(),
+            AgentConfig(max_population=2),
+        )
+
+        self.assertEqual(report.threat_level, "ENGAGED")
+        self.assertEqual(report.threat_reason, "RECENT_ATTACK")
+        self.assertEqual(core.actions, [("SPAWN", UnitType.RANGER)])
+
     def test_enemy_approach_inside_sixteen_tick_horizon_preemptively_evades(self):
         worker = FakeActor("worker", (0, 0))
         core = FakeActor("core", (0, 0))
@@ -1709,8 +1843,10 @@ class ArenaAgentTests(unittest.TestCase):
         core.hp = 5
         enemy = FakeActor("enemy", (50, 0), unit_type=UnitType.RANGER)
         turn = make_turn(worker=None, core=core, enemies=(enemy,))
+        turn.resources = 5
+        turn.state.population = 0
         memory = TacticMemory()
-        config = AgentConfig(spawn_unit_type=None)
+        config = AgentConfig(max_population=1)
 
         for tick, enemy_x in ((10, 50), (11, 49), (12, 48)):
             turn.tick = tick
@@ -1718,8 +1854,9 @@ class ArenaAgentTests(unittest.TestCase):
             core.actions.clear()
             report = plan_turn(turn, memory, config)
 
-        self.assertEqual(report.threat_level, "ALERT")
-        self.assertEqual(core.actions, [("WAIT",)])
+        self.assertEqual(report.threat_level, "NORMAL")
+        self.assertEqual(report.mission, "SCOUT")
+        self.assertEqual(core.actions, [("SPAWN", UnitType.WORKER)])
 
     def test_core_escape_does_not_step_toward_threat_in_dead_end(self):
         enemy = FakeActor("enemy", (-10, 0), unit_type=UnitType.VANGUARD)
@@ -1838,7 +1975,7 @@ class ArenaAgentTests(unittest.TestCase):
     def test_core_keeps_eight_tick_caution_after_combat_enemy_disappears(self):
         core = FakeActor("core", (0, 0))
         core.hp = 5
-        enemy = FakeActor("enemy", (20, 0), unit_type=UnitType.RANGER)
+        enemy = FakeActor("enemy", (10, 0), unit_type=UnitType.RANGER)
         turn = make_turn(worker=None, core=core, enemies=(enemy,))
         turn.resources = 5
         turn.state.population = 0

@@ -533,7 +533,6 @@ class TacticMemory:
     active_enemy_ids: set[str] = field(default_factory=set)
     pursuing_enemy_ids: set[str] = field(default_factory=set)
     preemptive_enemy_ids: set[str] = field(default_factory=set)
-    enemy_alert_until_tick: int = 0
     threat_caution_until_tick: int = 0
     recent_attack_until_tick: int = 0
     recent_attack_positions: dict[Position, int] = field(default_factory=dict)
@@ -630,14 +629,25 @@ class TacticMemory:
             self.core_lane_yield_worker_ids.clear()
         else:
             self.core_lane_yield_worker_ids.intersection_update(living_worker_ids)
+        friendly_units = tuple(getattr(turn, "units", ()))
         friendly_ids = {
             str(getattr(unit, "id", ""))
-            for unit in getattr(turn, "units", ())
+            for unit in friendly_units
             if getattr(unit, "id", None) is not None
         }
+        friendly_positions = {
+            str(getattr(unit, "id", "")): position
+            for unit in friendly_units
+            if getattr(unit, "id", None) is not None
+            and (position := _position(getattr(unit, "position", None))) is not None
+        }
         core = getattr(turn, "core", None)
-        if getattr(core, "id", None) is not None:
-            friendly_ids.add(str(core.id))
+        core_id = str(getattr(core, "id", "") or "")
+        core_position = _position(getattr(core, "position", None))
+        if core_id:
+            friendly_ids.add(core_id)
+            if core_position is not None:
+                friendly_positions[core_id] = core_position
         for event in getattr(turn, "events", ()):
             event_type = str(getattr(event, "event_type", "")).upper().rsplit(".", 1)[-1]
             reason_code = str(getattr(event, "reason_code", "")).upper().rsplit(".", 1)[-1]
@@ -661,12 +671,22 @@ class TacticMemory:
             own_attack = actor_id in friendly_ids and target_id not in friendly_ids
             if combat_event and not own_attack:
                 position = _position(getattr(event, "position", None))
+                if target_id == core_id and core_position is not None:
+                    position = core_position
+                if position is None:
+                    position = friendly_positions.get(target_id)
                 if position is not None:
                     self.recent_attack_positions[position] = tick
-                self.recent_attack_until_tick = max(
-                    self.recent_attack_until_tick,
-                    tick + RECENT_ATTACK_MEMORY_TICKS,
+                core_relevant = target_id == core_id or bool(
+                    core_position is not None
+                    and position is not None
+                    and _manhattan(core_position, position) <= CORE_ALERT_DISTANCE
                 )
+                if core_relevant:
+                    self.recent_attack_until_tick = max(
+                        self.recent_attack_until_tick,
+                        tick + RECENT_ATTACK_MEMORY_TICKS,
+                    )
             own_core_destroyed = (
                 event_type == "CORE_DESTROYED"
                 and target_id in friendly_ids
@@ -826,25 +846,19 @@ class TacticMemory:
             remembered_danger.add(enemy_position)
             for position in remembered_danger:
                 self.recent_combat_danger_positions[position] = tick
-            self.threat_caution_until_tick = max(
-                self.threat_caution_until_tick,
-                tick + POST_THREAT_CAUTION_TICKS,
-            )
-            previous = self.enemy_observation_memory.get(enemy_key)
-            moved = previous is not None and previous[1] != enemy_position
-            if moved:
-                self.enemy_alert_until_tick = max(
-                    self.enemy_alert_until_tick,
-                    tick + ACTIVE_ENEMY_ALERT_TICKS,
-                )
-            self.enemy_observation_memory[enemy_key] = (tick, enemy_position)
-
             unit_type = getattr(enemy, "unit_type")
             core_distance = (
                 _manhattan(core_position, enemy_position)
                 if core_position is not None
                 else sys.maxsize
             )
+            if core_distance <= CORE_ALERT_DISTANCE:
+                self.threat_caution_until_tick = max(
+                    self.threat_caution_until_tick,
+                    tick + POST_THREAT_CAUTION_TICKS,
+                )
+            self.enemy_observation_memory[enemy_key] = (tick, enemy_position)
+
             previous_motion = self.enemy_motion_memory.get(enemy_key)
             pursuit_score = 0
             activity_until_tick = 0
@@ -2703,7 +2717,6 @@ def _lifecycle_state(turn: Any, core: Any, memory: TacticMemory) -> str:
 def _mission_state(
     lifecycle: str,
     threat: ThreatAssessment,
-    enemies: list[Any],
     visible_resource_count: int,
     remembered_resource_count: int,
     cargo_worker_count: int = 0,
@@ -2712,7 +2725,7 @@ def _mission_state(
 
     if lifecycle != "ACTIVE":
         return "RECOVERY"
-    if threat.level in {"ALERT", "PRE_EVADE", "ENGAGED", "BREAKOUT"} or enemies:
+    if threat.level in {"ALERT", "PRE_EVADE", "ENGAGED", "BREAKOUT"}:
         return "GUARD"
     if visible_resource_count or remembered_resource_count or cargo_worker_count:
         return "ECONOMY"
@@ -2736,27 +2749,71 @@ def _assess_threat(
         )
         if position is not None
     ]
+    if core_position is None:
+        return ThreatAssessment()
+
+    nearest_distance = (
+        min(_manhattan(core_position, position) for position in enemy_positions)
+        if enemy_positions
+        else None
+    )
     recent_attack = memory.recent_attack_until_tick >= tick
-    if recent_attack:
+    recent_attack_distances = [
+        _manhattan(core_position, position)
+        for position, observed_at in memory.recent_attack_positions.items()
+        if 0 <= tick - observed_at <= RECENT_ATTACK_MEMORY_TICKS
+    ]
+    nearest_recent_attack = (
+        min(recent_attack_distances) if recent_attack_distances else None
+    )
+    pressure_distances = [
+        distance
+        for distance in (nearest_distance, nearest_recent_attack)
+        if distance is not None
+    ]
+    nearest_pressure_distance = min(pressure_distances) if pressure_distances else None
+    if recent_attack and (
+        nearest_recent_attack is None
+        or nearest_recent_attack <= CORE_EVADE_DISTANCE
+    ):
         return ThreatAssessment(
             level="ENGAGED",
             reason="RECENT_ATTACK",
+            nearest_distance=nearest_pressure_distance,
             recent_attack=True,
         )
-    if core_position is None:
-        return ThreatAssessment()
+    if (
+        recent_attack
+        and nearest_recent_attack is not None
+        and nearest_recent_attack <= CORE_ALERT_DISTANCE
+    ):
+        return ThreatAssessment(
+            level="ALERT",
+            reason="RECENT_ATTACK",
+            nearest_distance=nearest_pressure_distance,
+            recent_attack=True,
+        )
+
+    active_enemy_near_core = any(
+        enemy_id in memory.enemy_motion_memory
+        and _manhattan(
+            core_position,
+            memory.enemy_motion_memory[enemy_id].position,
+        )
+        <= CORE_ALERT_DISTANCE
+        for enemy_id in memory.active_enemy_ids
+    )
 
     if not enemy_positions:
         if memory.pursuing_enemy_ids:
             return ThreatAssessment(level="PRE_EVADE", reason="CONFIRMED_PURSUIT")
         if memory.preemptive_enemy_ids:
             return ThreatAssessment(level="PRE_EVADE", reason="TIME_TO_RANGE")
-        if memory.active_enemy_ids or memory.enemy_alert_until_tick >= tick:
+        if active_enemy_near_core:
             return ThreatAssessment(level="ALERT", reason="ENEMY_ACTIVITY")
         return ThreatAssessment()
 
-    distances = [_manhattan(core_position, position) for position in enemy_positions]
-    nearest_distance = min(distances)
+    assert nearest_distance is not None
     if _projected_incoming_damage(
         core_position,
         enemies,
@@ -2801,16 +2858,10 @@ def _assess_threat(
             reason="ENEMY_CLOSE",
             nearest_distance=nearest_distance,
         )
-    if memory.active_enemy_ids or memory.enemy_alert_until_tick >= tick:
-        return ThreatAssessment(
-            level="ALERT",
-            reason="ENEMY_ACTIVITY",
-            nearest_distance=nearest_distance,
-        )
     if nearest_distance <= CORE_ALERT_DISTANCE:
         return ThreatAssessment(
             level="ALERT",
-            reason="ENEMY_NEAR",
+            reason=("ENEMY_ACTIVITY" if active_enemy_near_core else "ENEMY_NEAR"),
             nearest_distance=nearest_distance,
         )
     return ThreatAssessment(nearest_distance=nearest_distance)
@@ -6976,14 +7027,28 @@ def _planned_core_move(
     if core is None or _core_is_moving(core):
         return None
     core_position = _position(getattr(core, "position", None))
+    pressure_enemies = [
+        enemy
+        for enemy in enemies
+        if (
+            (enemy_position := _position(getattr(enemy, "position", None)))
+            is not None
+            and core_position is not None
+            and (
+                _manhattan(core_position, enemy_position) <= CORE_ALERT_DISTANCE
+                or str(getattr(enemy, "id", "")) in memory.pursuing_enemy_ids
+                or str(getattr(enemy, "id", "")) in memory.preemptive_enemy_ids
+            )
+        )
+    ]
     if (
         core_position is not None
         and threat.level in {"PRE_EVADE", "ENGAGED", "BREAKOUT"}
-        and enemies
+        and pressure_enemies
     ):
         direction = _core_escape_direction(
             core_position,
-            enemies,
+            pressure_enemies,
             blocked,
             previous_direction=memory.last_core_escape_direction,
         )
@@ -7367,7 +7432,6 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
     mission = _mission_state(
         lifecycle,
         threat,
-        enemies,
         len(current_resources),
         len(remembered_resources),
         sum(

@@ -78,7 +78,7 @@ python .\arena_agent.py --max-turns 1
 - 障碍位置累积到独立的永久记忆中，用于选择下一步移动方向。
 - Vanguard 在相邻有战斗敌人时 `SWEEP`，Ranger 在合法射程和无遮挡条件下 `SHOOT`；优先处理正在攻击 Core 或确认追击的敌人，守卫岗位避开资源和危险格。
 - 活动敌军只触发防守和合法反击，不会触发远程追击；只有连续两个 Tick 位置不变且当前没有活动敌军压力时，才允许 Ranger 在合法射程内清除静止目标，非首位 Vanguard 最多在 6 格内有限靠近。
-- 威胁状态按 `NORMAL -> ALERT -> PRE_EVADE -> ENGAGED -> BREAKOUT` 处理：只跟踪 Vanguard/Ranger；结合 2 Tick 活动记忆、追击分数和 16 Tick 进入射程预测提前撤离，威胁消失后保持 8 Tick 谨慎期，近期受击进入交战，多方向逼近时突围。
+- 威胁状态按 `NORMAL -> ALERT -> PRE_EVADE -> ENGAGED -> BREAKOUT` 处理：只跟踪 Vanguard/Ranger；结合 2 Tick 活动记忆、追击分数和 16 Tick 进入射程预测提前撤离。Core 级受击使用距离闸门，8 格内进入交战、9–12 格只警戒、12 格外仅保留受击 Worker 的局部逃生和危险记忆，不会拆除货运通道或移动 Core；近距威胁消失后保持 8 Tick 谨慎期，多方向逼近时突围。
 - 控制台同时显示独立的生命周期和任务摘要：`ACTIVE/RESPAWNING/RECOVERY` 与 `ECONOMY/SCOUT/GUARD/RECOVERY`，它们是诊断层，不会覆盖具体威胁事实。
 - Core 撤退方向优先最小化下一 Tick 预计伤害，再比较敌军距离和移动连续性；移动目的地风险变差时会取消移动。受损防守单位在同类仍有后备且资源充足时返回 Core 治疗。
 - Core 处理低 HP 或低护盾后，按官方 SDK 动态价格分阶段补齐 `12/3/4 -> 16/6/8`；同一 Tick 先执行 Worker `DEPOSIT`，再把实际可交付资源用于生产判断，Core 移动时不会把交付或生产计入计划。
