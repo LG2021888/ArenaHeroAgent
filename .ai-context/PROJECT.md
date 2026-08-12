@@ -70,7 +70,9 @@ closed-pocket and single-entrance geometry.
   evacuation clears nearby empty Workers first; only one inbound owner is
   admitted; after deposit that owner follows a complete egress route into an
   open dynamic component before the next owner enters. Staging Cargo, guards,
-  and other Workers reserve the lane and egress path.
+  and other Workers reserve the lane and egress path. Egress planning may
+  cross temporary friendly occupancy so those Units can yield, but it must end
+  on a currently unoccupied open component and replan if that endpoint closes.
 - Keep exploration targets sticky per Worker. Use four Ticks without physical
   movement or three Ticks without route-cost improvement as scout stall
   signals; unreachable routes switch immediately. Resource assignment keeps
@@ -81,6 +83,13 @@ closed-pocket and single-entrance geometry.
   target instead of retrying forever.
 - Critically wounded defenders prioritize an immediately safer legal step and
   register for Core healing when resources and backup strength permit.
+- Keep Worker-local combat memory separate from Core-level threat. Retain all
+  hostile attack positions for Worker escape and return routing, but refresh
+  Core recent-attack state only when the Core is targeted or the attack is
+  within 12 Manhattan cells of it. Attacks within 8 cells are `ENGAGED`, those
+  at 9-12 cells are `ALERT`, and farther attacks do not force `GUARD`, clear a
+  Cargo lane, start production caution, or move the Core. Core escape also
+  requires a nearby visible enemy or a confirmed pursuing/preemptive enemy.
 - Enemy Core attacks remain a specialized observer/staging/raid/recall flow;
   enemy Cores are not injected into normal mobile-combat defense targeting.
 - `CORE_RESOURCES_CAPTURED` may invalidate captured enemy-Core memory but does
@@ -111,6 +120,8 @@ closed-pocket and single-entrance geometry.
   long repeated `MOVE_DESTINATION_OCCUPIED` / `MOVE_CONTESTED` loops.
 - Enemy encounters trigger bounded defense, Worker evasion, critical Defender
   retreat, healing, and recall without unsafe chasing.
+- A distant Worker attack preserves local escape memory without escalating the
+  whole base, dismantling an active Cargo lane, or moving the Core.
 - `CORE_RESOURCES_CAPTURED` from destroying an enemy Core does not put the
   friendly mission into recovery.
 - Protocol/API/transport failures are classified and recorded without hiding

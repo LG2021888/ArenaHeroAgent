@@ -170,9 +170,9 @@ Only decisions with direct repository or runtime evidence are recorded here.
   departure, staging Cargo cannot enter early, and active lane reservations
   cannot recursively trigger `CORE_POCKET_BLOCKED`.
 - **Evidence:** Commit `0769085`, `CorePocketStatus`, `CargoLanePlan`,
-  `_update_core_pocket`, `_update_cargo_lane`, Tick 89304/89475/93715
-  regression fixtures, all 157 tests, and the live Tick 93977-93983
-  deposit/egress/next-owner sequence.
+  `_update_core_pocket`, `_update_cargo_lane`, commits `29c1386` and `fd859e5`,
+  Tick 89304/89475/93715 regression fixtures, the congested-egress tests, and
+  the live Tick 93977-93983 deposit/egress/next-owner sequence.
 
 ## 2026-08-12 - Close The Combat Movement Feedback Loop
 
@@ -195,3 +195,28 @@ Only decisions with direct repository or runtime evidence are recorded here.
 - **Evidence:** Commits `cf67056` and `0769085`, combat move-failure memory and
   stationary-clear cooldowns in `arena_agent.py`, historical enemy-Core
   occupancy tests, damaged-defender tests, and the full 157-test suite.
+
+## 2026-08-12 - Gate Core Threat Escalation By Attack Distance
+
+- **Decision:** Always retain hostile attack positions for affected Workers'
+  local escape and return danger memory. Refresh Core-level recent-attack state
+  only when the Core is targeted or the attack position is within 12 Manhattan
+  cells of it. Classify recent attacks within 8 cells as `ENGAGED`, attacks at
+  9-12 cells as `ALERT`, and attacks beyond 12 cells as no Core threat. Core
+  movement independently requires a visible enemy within 12 cells or a
+  confirmed pursuing/preemptive enemy.
+- **Reason:** At Tick 94853 Worker `695266bb` was attacked 45 cells from the
+  Core. The global recent-attack flag incorrectly changed the mission to
+  `GUARD`, cleared inbound Cargo owner `f0c09f3e`, delayed its deposit by about
+  11 Ticks, and moved the Core twice even though all three Rangers were 45-47
+  cells away.
+- **Rejected alternative:** Continue treating every hostile combat event or
+  every moving visible enemy as base-wide pressure, or discard distant attack
+  positions entirely and lose the Worker's local escape memory.
+- **Impact:** Distant scouts can encounter enemies without disrupting Core
+  logistics or production. Close attacks still trigger the existing defense,
+  emergency production, movement, and eight-Tick post-threat caution policy;
+  confirmed pursuit and 16-Tick time-to-range preemption remain active.
+- **Evidence:** Commit `91d6f52`, the historical Tick 94853 replay, the far
+  attack/Cargo-lane regression, 8- and 12-cell boundary tests, emergency-spawn
+  distance coverage, and the full 164-test suite.

@@ -1,185 +1,141 @@
 ---
 schema: project-context/v1
-updated_at: 2026-08-12T12:41:47+08:00
+updated_at: 2026-08-12T17:17:00+08:00
 updated_by: Codex
 branch: main
-head: 076908544c427310deae144a49df582cc10d7e74
-working_tree: shared workspace; business code clean; root context files are updated and the fixed local snapshot is merged and archived
+head: 91d6f52c582ee60716773e1f1e19b2cba88259ba
+working_tree: business code committed; root context files updated after the commit; no pending local handoff snapshots
 ---
 
 # Current Handoff
 
 ## Current Goal
 
-Keep the continuously running Arena Hero agent stable while validating the
-completed population-expansion, combat-feedback, Core-pocket bridge, and
-single-entrance half-duplex Cargo-lane changes under live conditions.
+Keep the continuously running Arena Hero Agent stable while validating the
+distance-gated Core threat fix and the existing single-entrance half-duplex
+Cargo lane under live conditions.
 
-The implementation is committed. The next work is runtime observation rather
-than another redesign: confirm deposits keep flowing through the one usable
-entrance, critically wounded defenders retreat on a real damage event, and
-combat Units no longer repeat failed moves into enemy-occupied cells.
+The reported fault is fixed and committed. A hostile attack against a Worker
+45 cells from Core must retain that Worker's local escape memory without
+changing the base to `ENGAGED/GUARD`, dismantling an inbound Cargo lane, or
+moving Core. The next work is observation of the live Agent, not another
+combat-policy redesign.
 
 ## Completed
 
-- Commit `cf67056` (`人口扩容和逻辑优化`) added optional post-target
-  expansion. Automatic production still restores
-  `4/1/1 -> 12/3/4 -> 16/6/8` first, then can grow proportionally toward
-  `Worker:Vanguard:Ranger = 8:3:4`.
-- Runtime expansion is enabled with no strategy hard cap, a base resource
-  threshold of 150, and a six-Unit casualty-capacity buffer. The startup log
-  records `Population expansion=ON(threshold=150,casualty_buffer=6)`.
-- `CORE_RESOURCES_CAPTURED` no longer starts friendly recovery. It can still
-  invalidate captured enemy-Core memory; only `CORE_LOST` or destruction of
-  the friendly Core starts the recovery window.
-- Cargo-return danger memory and escape scoring protect exposed Workers.
-  Equal projected-damage escape choices first reduce Manhattan distance and
-  then dominant-axis (Chebyshev) separation from the friendly Core, avoiding
-  the historical WEST/DOWN tie that selected the wrong escape direction.
-- Critical Vanguards (HP <= 2) and Rangers (HP <= 1) attempt an immediately
-  safer legal step before normal combat and can enter Core-healing flow when
-  resources and backup permit.
-- Enemy-occupied destinations are hard combat-movement blockers.
-  `UNIT_MOVE_FAILED` feedback applies to all Unit types, temporarily avoids
-  contested/occupied destinations, and cools repeatedly failing stationary
-  targets. This addresses the historical 284-Tick Vanguard failure loop.
-- Bounded reverse flood-fill detects genuine closed Core pockets using an
-  exhausted local component, admitted-Cargo flow evidence, externally
-  statically reachable Cargo, stable Core/Cargo continuity, and two-Tick
-  debounce. An admitted Cargo is one already on Core or adjacent to the Core
-  component, not one whose occupied cell belongs to the component. A local
-  weighted bridge and staged single owner handle closure.
-- Commit `0769085` (`单口半双工交接修复`) added single-open-entrance control.
-  `CargoLanePlan` now tracks `STARTUP_EVACUATION`, `INBOUND`, `DEPOSIT`, and
-  `EGRESS`, a departing Worker, a complete egress path/target, startup
-  evacuation IDs, and staging assignments.
-- Startup evacuation serializes empty Workers already accumulated near Core.
-  One Cargo owner enters; after deposit it must leave the full lane and reach
-  an open dynamic component before the next owner is admitted. A dead side
-  pocket does not count as completed egress.
-- Diagnostics expose `CARGO_LANE_EGRESS` and `CARGO_LANE_YIELD`. Active lane
-  control disables the older `core_lane_*` controller, reserves the full lane
-  and egress path against Cargo/guards/staging traffic, and does not recursively
-  create a `CORE_POCKET_BLOCKED` diagnosis.
-- Core movement, inability to accept delivery, or threat states
-  `PRE_EVADE` / `ENGAGED` / `BREAKOUT` invalidate or suspend lane use.
+- Commit `91d6f52` (`限制远端受击的基地威胁升级`) separates Worker-local attack
+  memory from Core-level threat. All hostile attack positions remain available
+  to Worker return and escape planning, but only a direct Core hit or an attack
+  within 12 Manhattan cells refreshes Core recent-attack state.
+- The recent-attack thresholds are now explicit: within 8 cells is `ENGAGED`,
+  9-12 cells is `ALERT`, and beyond 12 cells does not escalate the Core.
+- `_assess_threat` fills `nearest_distance` from the closest visible enemy or
+  qualifying attack position, so close-hit emergency production uses the
+  actual nearby pressure distance.
+- Moving visible enemies outside 12 cells no longer create `ALERT/GUARD` or
+  the eight-Tick production caution window merely because they moved.
+  Confirmed pursuit and 16-Tick time-to-range preemption are preserved.
+- `_planned_core_move` independently filters pressure to visible enemies
+  within 12 cells or IDs already confirmed as pursuing/preemptive. A stale or
+  malformed `ENGAGED` state therefore cannot make Core flee from an unrelated
+  distant visible enemy.
+- Mission state no longer becomes `GUARD` merely because any combat enemy is
+  visible; it follows the threat assessment.
+- README documents the 8/12-cell policy. Tests cover the historical far Worker
+  attack with an active `INBOUND` lane, the 10-cell alert boundary, the 7-cell
+  engaged/movement case, close-attack emergency production with only a distant
+  visible enemy, distant non-pursuing movement, and retained caution/pursuit
+  behavior.
+- Historical Tick 94853 offline replay produced `NORMAL/NONE`, mission
+  `ECONOMY`, no Core move, an active Cargo lane with owner `f0c09f3e`
+  preserved, no Core recent-attack refresh, and retained Worker danger memory.
+- Commits `29c1386` and `fd859e5` remain in the base. Congested Cargo egress
+  can plan through temporary friendly occupancy to create yield assignments,
+  must finish on an unoccupied open component, and replans when an endpoint
+  becomes dynamically closed.
 
 ## Evidence And Runtime Snapshot
 
 - Repository is on `main` at
-  `076908544c427310deae144a49df582cc10d7e74`; `origin/main` is identical.
-- Business code is clean. The working tree changes are the root context-file
-  updates plus untracked `.ai-context/handoffs/`, which is local handoff-queue
-  data and must not be deleted or committed by default.
-- This handoff merges and archives snapshot
-  `handoff-20260812T042348676Z-d14fda0a.md` (SHA-256
-  `5febccd2dd6a50ad705100e930efc4d9f45c4941cfdf337d55f4e734f813e41c`).
-  The source window performed read-only runtime review and made no business
-  code change or service restart.
+  `91d6f52c582ee60716773e1f1e19b2cba88259ba`, one local commit ahead of
+  `origin/main` (`fd859e5`). The business-code commit has not been pushed.
 - Shared-workspace verification on 2026-08-12 passed:
-  `py_compile` for both Python files, `Ran 157 tests ... OK`, and
-  `git diff --check` with no errors.
-- Historical regression fixtures cover Tick 89304 normal admitted delivery,
-  Tick 89475's exact nine-cell closed pocket with seven external Cargo, and
-  Tick 93715's single right-side entrance with seven nearby empty Workers.
-- `run_arena_agent.bat` remains one process group started at
-  2026-08-12 12:01:56 local time: `cmd.exe` PID 21560, project-venv Python PID
-  28400, and Python runtime PID 11332.
-- Active session is `1f5d354d98524ea8a5897f3566a0d249`; live roster is
-  `17 Workers / 7 Vanguards / 9 Rangers = 33`.
-- Stats through Tick 94124 recorded 150/150 accepted Ticks, 0 rejected,
-  5 deposits, 9 harvests, 1922 successful Unit moves, and no recorded
-  move-failure, damage, or death event. Tick 94124 was accepted with resources
-  42, no threat, and no production.
-- `production=NONE` at resources 42 is expected. At population 33 the
-  post-target gate is `max(150, capacity 165 - 30) = 150`; production remains
-  off until available resources reach that gate and normal price/reserve
-  checks pass.
-- The earlier 95-resource reduction was user-initiated manual spending and is
-  not an unexplained strategy loss.
-- Proven live handoff: Tick 93977 deposited (`37 -> 38`), owner `a975bdda`
-  remained in `CARGO_LANE_EGRESS` through Tick 93982, and Tick 93983 admitted
-  owner `6553c3ed` only after the old owner reached an open component. The
-  window had zero `UNIT_MOVE_FAILED` events.
-- Source-snapshot live evidence records a real startup evacuation beginning at
-  Tick 93961: four nearby empty Workers were serialized, departing owner moved
-  from `9a2a356b` to `6e8fe8f1`, and the lane reached `INBOUND` about ten Ticks
-  later. Those earliest Ticks have since rotated out of the current trace, so
-  this particular claim retains source-snapshot provenance.
-- The same source replay measured the `CORE_POCKET` filter chain over 361
-  Ticks: raw geometric closure 113 Ticks, no admitted Cargo 39, external static
-  reachability 39, debounced activation 8 Ticks across 5 events, with zero
-  overlap with deposit Ticks. This supports the admitted-Cargo suppression and
-  debounce already covered by current code and regression tests.
-- Current live lane at Tick 94124 is `INBOUND` with owner `9a2a356b`, no queued
-  owner, and gateway `(-215,668)`.
-- Tick 94030 had transient command-submission transport failures. The bounded
-  retry/reconnect loop recovered without process replacement; Tick 94035 and
-  all observed Ticks through 94081 were accepted.
+  `py_compile` for `arena_agent.py` and `test_arena_agent.py`,
+  `Ran 164 tests ... OK`, and `git diff HEAD --check` with no errors.
+  Unit tests do not connect to Arena API.
+- The old 16:48 Agent process group was stopped exactly and replaced once so
+  the live runtime loads `91d6f52`. The current group started at 17:11:42:
+  `cmd.exe` PID 22680, project-venv Python PID 31048, and runtime Python PID
+  24956. The two Python processes are one launcher/runtime chain, not two
+  Agents.
+- Active session is `f2989b94c8114fa0b03e6c13bfe454c6`. It accepted Ticks
+  95165 onward without duplicate-agent, idempotency, or command-rejection
+  errors.
+- Live Cargo handoff completed after the restart: owner `dd996335` stayed
+  `INBOUND` through Tick 95194, queued a one-resource deposit at Tick 95195,
+  resources changed `75 -> 76` at Tick 95196, and the same owner remained in
+  `EGRESS` through Tick 95202. Only at Tick 95203 did the lane admit the next
+  owner `695266bb`. Throughout this sequence the Core stayed at `(-217,668)`,
+  threat was `NORMAL`, and mission was `ECONOMY`. Persistent
+  `exploration_anchor` is also `(-217,668)`.
+- Current roster is `16 Workers / 7 Vanguards / 9 Rangers = 32`. Production
+  below the configured post-target threshold of 150 resources is expected to
+  remain off.
+- The live session has not yet produced another far Worker attack while an
+  inbound lane is active. The exact regression and historical offline replay
+  prove the code path; a new live incident remains observation evidence, not a
+  prerequisite for considering the defect fixed.
 
 ## Accurate Breakpoint And Next Steps
 
-1. Do not start a second Agent while the verified process group above, or its
-   replacement, is active. Recheck executable paths and start times before
-   stopping or restarting anything.
-2. Continue observing the current owner `9a2a356b`. Verify
-   `INBOUND -> DEPOSIT -> EGRESS`, full departure into an open component, and
-   only then admission of any queued owner.
-3. Watch for the first genuine closed-pocket bridge execution. The detector
-   and debounce are live, but the source review found no confirmed real run of
-   the r=8 weighted bridge. `CORE_POCKET_BLOCKED` must not accumulate merely
-   because the active lane reserves cells.
-4. On the next Defender `UNIT_DAMAGED` event, correlate the next action,
-   projected danger, later `SHOT_HIT`, and healing. Unit tests cover critical
-   retreat, but this restarted session has not yet produced damage evidence.
-5. Watch `UNIT_MOVE_FAILED` per actor. A combat Unit must not accumulate tens
-   or hundreds of retries at one enemy-occupied destination; validate the
-   avoid window and stationary-target cooldown when a real failure occurs.
-6. Validate staging-target reachability before changing the controller. The
-   source snapshot flagged Tick 93990, where `static_reachable_cargo_ids` was
-   empty while `c3ca0560` had stage target `(-220,668)`; current stage-target
-   selection ranks estimated path cost but does not explicitly reject the
-   unreachable sentinel.
-7. Measure lane throughput only in a real backlog of at least four Cargo.
-   Earlier 18-Tick deposit spacing was supply-limited, not enough to assess
-   the half-duplex controller's maximum throughput.
-8. Do not classify `production=NONE` below 150 resources as a fault. At the
-   current `17/7/9` ratio the next proportional expansion choice is expected
-   to be a Worker once the resource gate opens.
-9. Before future code edits, stop only the verified project Agent if runtime
-   mutation is necessary. Re-run `py_compile`, all 157+ tests, and
-   `git diff --check`; restart only when requested.
+1. Do not start a second Agent while the verified 17:11:42 process group is
+   active. Recheck executable paths and start times before any restart.
+2. Follow the current owner `695266bb` through its delivery cycle. The previous
+   `dd996335` handoff already proved complete `INBOUND -> DEPOSIT -> EGRESS ->
+   next owner` ordering after the restart.
+3. On the next far `UNIT_DAMAGED` event, correlate the attack position with
+   Core distance. Beyond 12 cells, expect `NORMAL/NONE` unless another genuine
+   near/pursuit threat exists; the lane owner and Core position must remain
+   stable while the affected Worker keeps local danger/return behavior.
+4. For attacks at 9-12 cells, expect `ALERT/GUARD` without Core movement or
+   Cargo-lane clearing. Within 8 cells, expect existing `ENGAGED` defense,
+   possible Core movement when a qualifying pressure enemy is visible, and
+   the eight-Tick post-threat production caution.
+5. Watch `UNIT_MOVE_FAILED` per combat actor and the next critically wounded
+   Defender event; these mechanisms remain unit-tested but need additional
+   live evidence.
+6. Measure half-duplex throughput only under a real backlog of at least four
+   Cargo. One physical entrance remains serial by design.
+7. Before future business-code edits, stop only the verified project Agent,
+   then rerun `py_compile`, all 164+ tests, and `git diff --check`; restart
+   exactly once.
 
 ## Blockers And Open Questions
 
 - No code blocker is known.
-- Live validation has proven one complete post-deposit egress/handoff cycle,
-  and the merged source snapshot records a real four-Worker startup evacuation.
-- Critical Defender retreat and combat move-failure feedback have regression
-  tests but no new live-event evidence in the restarted session.
-- The genuine r=8 closed-pocket bridge has not yet been observed executing in
-  live play.
-- Staging-target reachability at Tick 93990 remains a review finding, not a
-  confirmed defect; reproduce it before editing policy.
-- Half-duplex throughput under a backlog of at least four Cargo remains
-  unmeasured.
-- One physical entrance remains throughput-limited. The controller guarantees
-  ordering and eventual evacuation, not simultaneous inbound/outbound flow.
+- The far-attack regression is fixed, committed, replayed offline, and loaded
+  by the live Agent. A fresh live far-attack event has not yet occurred.
+- The Core already moved from the original `(-217,666)` to `(-217,668)` before
+  this fix. The repair prevents future false moves; it intentionally does not
+  move Core back automatically. The exploration anchor has correctly followed
+  the current Core to `(-217,668)`.
+- Critical Defender retreat and combat move-failure feedback still have no new
+  live-event evidence in the current session.
+- The genuine r=8 closed-pocket bridge and half-duplex throughput under a
+  four-Cargo backlog remain unmeasured live cases.
 - Never print, commit, or copy the live `ARENA_HERO_API_KEY`.
 
 ## Key Files
 
-- `arena_agent.py`: strategy, Cargo lanes, route search, occupancy, combat,
-  Core raid, production, SDK compatibility, retries, and diagnostics.
-- `test_arena_agent.py`: 157 in-memory behavior and regression tests.
-- `.env`: live local configuration and secret; never expose its contents.
-- `.env.example`: non-secret defaults (`MAX_POPULATION=0`, expansion default
-  OFF, threshold 150, casualty buffer 6).
-- `README.md`: startup, dynamic pricing, expansion, roster, and strategy.
-- `run_arena_agent.bat`: user-facing formal Agent launcher.
-- `arena_agent.log`, `arena_agent_trace.jsonl`, and
-  `arena_agent_stats.json`: current runtime evidence.
-- `arena_agent_state.json`: persistent safe map memory.
+- `arena_agent.py`: threat gating, Worker danger memory, Cargo lanes, routing,
+  combat, production, retries, and diagnostics.
+- `test_arena_agent.py`: 164 in-memory behavior and regression tests.
+- `README.md`: documented 8/12-cell Core threat policy and runtime behavior.
+- `.env`: live secret configuration; never expose its contents.
+- `run_arena_agent.bat`: the only formal runtime launcher.
+- `arena_agent.log`, `arena_agent_trace.jsonl`, `arena_agent_stats.json`, and
+  `arena_agent_state.json`: current runtime evidence and persistent safe map
+  memory.
 
 ## Verification
 
@@ -189,9 +145,8 @@ combat Units no longer repeat failed moves into enemy-occupied cells.
 git diff --check
 ```
 
-Expected shared-workspace result at this handoff: `Ran 157 tests ... OK`.
-These commands do not connect to Arena API and must not start
-`run_arena_agent.bat`.
+Expected shared-workspace result at this handoff: `Ran 164 tests ... OK`.
+These commands must not connect to Arena API or start another Agent.
 
 ## User Constraints To Preserve
 
@@ -205,6 +160,8 @@ These commands do not connect to Arena API and must not start
   bypass.
 - Preserve half-duplex single-entrance ordering and complete open-component
   egress before admitting the next Cargo owner.
+- Keep Worker-local danger memory for far attacks while enforcing the Core
+  threat gates at 8 and 12 Manhattan cells.
 - Keep enemy Core raids separate from normal defense and do not use blind
   Ranger fire.
 - Treat user-reported manual Core/Ranger movement and manual resource spending
