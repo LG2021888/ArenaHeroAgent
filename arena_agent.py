@@ -145,6 +145,8 @@ POPULATION_EXPANSION_CASUALTY_BUFFER_UNITS = 6
 ADMITTED_CARGO_STALL_TICKS = 3
 CARGO_LANE_RADIUS = 8
 CARGO_LANE_STAGE_RADII = (3, 4, 5)
+CARGO_LANE_GATEWAY_STEPS = 3
+CARGO_LANE_STARTUP_RADIUS = 3
 
 
 class _Ansi:
@@ -476,11 +478,16 @@ class CargoLaneBridge:
 @dataclass
 class CargoLanePlan:
     active: bool = False
+    phase: str = "INBOUND"
     core_position: Position | None = None
     owner_id: str | None = None
     queued_owner_id: str | None = None
+    departing_worker_id: str | None = None
     path: tuple[Position, ...] = ()
     gateway: Position | None = None
+    egress_path: tuple[Position, ...] = ()
+    egress_target: Position | None = None
+    startup_pending_ids: set[str] = field(default_factory=set)
     yield_worker_ids: set[str] = field(default_factory=set)
     stage_targets: dict[str, Position] = field(default_factory=dict)
     started_tick: int = 0
@@ -1539,6 +1546,14 @@ def _trace_actor(actor: Any) -> dict[str, Any]:
 
 def _worker_mode(worker: Any, memory: TacticMemory, tick: int) -> str:
     worker_key = str(getattr(worker, "id", ""))
+    lane = memory.cargo_lane
+    if lane.active and worker_key == lane.departing_worker_id:
+        return "CARGO_LANE_EGRESS"
+    if lane.active and (
+        worker_key in lane.startup_pending_ids
+        or worker_key in lane.yield_worker_ids
+    ):
+        return "CARGO_LANE_YIELD"
     if worker_key == memory.core_lane_departing_worker_id:
         return "CORE_CLEAR"
     if worker_key in memory.core_lane_yield_worker_ids:
@@ -1847,10 +1862,17 @@ class SessionRecorder:
         lane = memory.cargo_lane
         if lane.active:
             payload["cargo_lane"] = {
+                "phase": lane.phase,
                 "owner_id": lane.owner_id,
                 "queued_owner_id": lane.queued_owner_id,
+                "departing_worker_id": lane.departing_worker_id,
                 "path": [_json_position(position) for position in lane.path],
                 "gateway": _json_position(lane.gateway),
+                "egress_path": [
+                    _json_position(position) for position in lane.egress_path
+                ],
+                "egress_target": _json_position(lane.egress_target),
+                "startup_pending_ids": sorted(lane.startup_pending_ids),
                 "yield_worker_ids": sorted(lane.yield_worker_ids),
                 "stage_targets": {
                     worker_id: _json_position(target)
@@ -3276,6 +3298,7 @@ def _update_core_pocket(
         and static_reachable_ids
         and core_accepts_delivery
         and not deposit_succeeded
+        and not memory.cargo_lane.active
     )
     same_sequence = bool(
         candidate
@@ -3596,6 +3619,191 @@ def _select_cargo_lane_owner(
     return owner, route
 
 
+def _cargo_lane_open_route(
+    start: Position,
+    core_position: Position,
+    lane_path: set[Position],
+    blocked: set[Position],
+    friendly_occupancy: dict[Position, int],
+    *,
+    block_core: bool = False,
+) -> tuple[Position, ...] | None:
+    """Find a complete route from a local Core pocket into open space."""
+
+    dynamic_blocked = set(blocked) | set(friendly_occupancy)
+    dynamic_blocked.discard(start)
+    if block_core:
+        dynamic_blocked.add(core_position)
+    visited = {start}
+    parents: dict[Position, Position] = {}
+    frontier = deque((start,))
+    exit_candidates: list[Position] = []
+    while frontier and len(visited) < CORE_POCKET_MAX_CELLS:
+        current = frontier.popleft()
+        if (
+            current not in lane_path
+            and max(
+                abs(current[0] - core_position[0]),
+                abs(current[1] - core_position[1]),
+            ) > CARGO_LANE_STARTUP_RADIUS
+        ):
+            exit_candidates.append(current)
+        for direction in CARDINAL_DIRECTIONS:
+            destination = _next_position(current, direction)
+            if destination in dynamic_blocked or destination in visited:
+                continue
+            parents[destination] = current
+            visited.add(destination)
+            frontier.append(destination)
+            if len(visited) >= CORE_POCKET_MAX_CELLS:
+                break
+    if not frontier or not exit_candidates:
+        return None
+    target = min(
+        exit_candidates,
+        key=lambda position: (
+            _manhattan(start, position),
+            position[0],
+            position[1],
+        ),
+    )
+    path = [target]
+    while path[-1] != start:
+        path.append(parents[path[-1]])
+    path.reverse()
+    return tuple(path)
+
+
+def _single_open_cargo_lane_path(
+    core_position: Position,
+    blocked: set[Position],
+    friendly_occupancy: dict[Position, int],
+) -> tuple[Position, ...] | None:
+    """Return the sole outward Core gateway, if local geometry has one."""
+
+    paths: list[tuple[Position, ...]] = []
+    for direction in CARDINAL_DIRECTIONS:
+        neighbor = _next_position(core_position, direction)
+        if neighbor in blocked:
+            continue
+        route = _cargo_lane_open_route(
+            neighbor,
+            core_position,
+            {core_position},
+            blocked,
+            friendly_occupancy,
+            block_core=True,
+        )
+        if route is not None:
+            paths.append((core_position,) + route)
+    if len(paths) != 1:
+        return None
+    path = paths[0]
+    if len(path) <= CARGO_LANE_GATEWAY_STEPS:
+        return None
+    return path[: CARGO_LANE_GATEWAY_STEPS + 1]
+
+
+def _cargo_lane_egress_complete(
+    position: Position,
+    lane: CargoLanePlan,
+    blocked: set[Position],
+    friendly_occupancy: dict[Position, int],
+) -> bool:
+    if lane.core_position is None or position in set(lane.path):
+        return False
+    if max(
+        abs(position[0] - lane.core_position[0]),
+        abs(position[1] - lane.core_position[1]),
+    ) <= CARGO_LANE_STARTUP_RADIUS:
+        return False
+    dynamic_blocked = set(blocked) | set(friendly_occupancy)
+    dynamic_blocked.discard(position)
+    _, closed = _bounded_reachable_component(position, dynamic_blocked)
+    return not closed
+
+
+def _cargo_lane_egress_route(
+    start: Position,
+    lane: CargoLanePlan,
+    blocked: set[Position],
+    friendly_occupancy: dict[Position, int],
+) -> tuple[Position, ...] | None:
+    if lane.core_position is None or lane.gateway is None:
+        return None
+    dynamic_blocked = set(blocked) | set(friendly_occupancy)
+    dynamic_blocked.discard(start)
+    to_gateway = _complete_route(start, lane.gateway, dynamic_blocked)
+    if to_gateway.status != "SUCCESS":
+        return None
+    outward_blocked = set(blocked) | set(friendly_occupancy) | set(lane.path)
+    outward_blocked.discard(lane.gateway)
+    outward = _cargo_lane_open_route(
+        lane.gateway,
+        lane.core_position,
+        set(lane.path),
+        outward_blocked,
+        {},
+        block_core=True,
+    )
+    if outward is None:
+        return None
+    return to_gateway.path + outward[1:]
+
+
+def _cargo_lane_startup_workers(
+    workers: Iterable[Any],
+    core_position: Position,
+) -> set[str]:
+    return {
+        str(getattr(worker, "id", ""))
+        for worker in workers
+        if str(getattr(worker, "id", ""))
+        and int(getattr(worker, "cargo", 0)) == 0
+        and (
+            (position := _position(getattr(worker, "position", None))) is not None
+        )
+        and max(
+            abs(position[0] - core_position[0]),
+            abs(position[1] - core_position[1]),
+        ) <= CARGO_LANE_STARTUP_RADIUS
+    }
+
+
+def _select_cargo_lane_departing_worker(
+    lane: CargoLanePlan,
+    workers_by_id: dict[str, Any],
+    blocked: set[Position],
+    friendly_occupancy: dict[Position, int],
+) -> None:
+    if lane.core_position is None:
+        return
+    candidates: list[tuple[int, str, tuple[Position, ...]]] = []
+    for worker_id in sorted(lane.startup_pending_ids):
+        worker = workers_by_id.get(worker_id)
+        position = _position(getattr(worker, "position", None))
+        if worker is None or position is None or int(getattr(worker, "cargo", 0)) > 0:
+            continue
+        route = _cargo_lane_egress_route(
+            position,
+            lane,
+            blocked,
+            friendly_occupancy,
+        )
+        if route is not None:
+            candidates.append((len(route), worker_id, route))
+    if not candidates:
+        lane.departing_worker_id = None
+        lane.egress_path = ()
+        lane.egress_target = None
+        return
+    _, worker_id, route = min(candidates)
+    lane.departing_worker_id = worker_id
+    lane.egress_path = route
+    lane.egress_target = route[-1]
+    lane.phase = "STARTUP_EVACUATION"
+
+
 def _refresh_cargo_lane_occupants(
     turn: Any,
     memory: TacticMemory,
@@ -3607,7 +3815,7 @@ def _refresh_cargo_lane_occupants(
     if not lane.active or lane.core_position is None or lane.gateway is None:
         return
     workers = tuple(getattr(turn, "workers", ()))
-    lane_positions = set(lane.path)
+    lane_positions = set(lane.path) | set(lane.egress_path)
     workers_by_id = {
         str(getattr(worker, "id", "")): worker
         for worker in workers
@@ -3624,20 +3832,25 @@ def _refresh_cargo_lane_occupants(
         queued_owner is not None and int(getattr(queued_owner, "cargo", 0)) > 0
     )
     owner_ready_for_queue = bool(
-        owner_position in lane_positions
-        or (
-            owner_position is not None
-            and lane.gateway is not None
-            and _manhattan(owner_position, lane.gateway) == 1
+        lane.phase in {"INBOUND", "DEPOSIT"}
+        and (
+            owner_position in lane_positions
+            or (
+                owner_position is not None
+                and lane.gateway is not None
+                and _manhattan(owner_position, lane.gateway) == 1
+            )
         )
     )
-    admit_queued_to_gateway = bool(
-        queued_owner_has_cargo and owner_ready_for_queue
-    )
+    # A queued Cargo must not occupy the shared gateway until the previous
+    # depositor has reached open space.
+    admit_queued_to_gateway = False
     lane.yield_worker_ids = {
         str(getattr(worker, "id", ""))
         for worker in workers
         if str(getattr(worker, "id", "")) != lane.owner_id
+        and str(getattr(worker, "id", "")) != lane.departing_worker_id
+        and str(getattr(worker, "id", "")) not in lane.startup_pending_ids
         and _position(getattr(worker, "position", None))
         in lane_positions | core_neighbors
         and not (
@@ -3645,13 +3858,16 @@ def _refresh_cargo_lane_occupants(
             and _position(getattr(worker, "position", None)) == lane.gateway
         )
     }
-    non_owner_cargo = [
+    staged_cargo = [
         worker
         for worker in workers
         if int(getattr(worker, "cargo", 0)) > 0
-        and str(getattr(worker, "id", "")) != lane.owner_id
+        and not (
+            lane.phase in {"INBOUND", "DEPOSIT"}
+            and str(getattr(worker, "id", "")) == lane.owner_id
+        )
     ]
-    cargo_ids = {str(getattr(worker, "id", "")) for worker in non_owner_cargo}
+    cargo_ids = {str(getattr(worker, "id", "")) for worker in staged_cargo}
     stages_valid = (
         set(lane.stage_targets) == cargo_ids
         and all(
@@ -3676,7 +3892,7 @@ def _refresh_cargo_lane_occupants(
     )
     if not stages_valid:
         lane.stage_targets = _cargo_stage_targets(
-            non_owner_cargo,
+            staged_cargo,
             lane.core_position,
             lane.gateway,
             lane_positions,
@@ -3697,6 +3913,7 @@ def _update_cargo_lane(
     memory: TacticMemory,
     *,
     core_accepts_delivery: bool,
+    core_stable: bool,
     threat_level: str,
 ) -> CargoLanePlan:
     tick = int(getattr(turn, "tick", 0))
@@ -3721,27 +3938,197 @@ def _update_cargo_lane(
     unsafe = threat_level in {"PRE_EVADE", "ENGAGED", "BREAKOUT"}
     if (
         core_position is None
+        or not core_stable
         or unsafe
-        or not core_accepts_delivery
-        or not cargo_workers
         or (lane.active and lane.core_position != core_position)
     ):
         _clear_cargo_lane(memory)
         return memory.cargo_lane
 
-    owner = workers_by_id.get(lane.owner_id or "") if lane.active else None
+    if not lane.active:
+        if not core_accepts_delivery:
+            return lane
+        single_path = _single_open_cargo_lane_path(
+            core_position,
+            blocked | danger_cells,
+            friendly_occupancy,
+        )
+        startup_pending_ids = (
+            _cargo_lane_startup_workers(workers, core_position)
+            if single_path is not None
+            else set()
+        )
+        owner = None
+        selection_route = None
+        if cargo_workers:
+            owner, selection_route = _select_cargo_lane_owner(
+                cargo_workers,
+                core_position,
+                blocked,
+                memory,
+            )
+        if owner is None and not startup_pending_ids:
+            return lane
+        if single_path is not None:
+            bridge = CargoLaneBridge(
+                path=single_path,
+                gateway=single_path[-1],
+                blocker_ids=frozenset(),
+            )
+        elif memory.core_pocket.blocked and owner is not None:
+            assert selection_route is not None
+            bridge = _local_cargo_lane_bridge(
+                core_position,
+                owner,
+                selection_route.path,
+                blocked,
+                danger_cells,
+                getattr(turn, "units", ()),
+            )
+            if bridge is None:
+                return lane
+        else:
+            return lane
+        owner_id = str(getattr(owner, "id", "")) if owner is not None else None
+        lane = CargoLanePlan(
+            active=True,
+            core_position=core_position,
+            owner_id=owner_id,
+            path=bridge.path,
+            gateway=bridge.gateway,
+            startup_pending_ids=startup_pending_ids,
+            started_tick=tick,
+            last_planned_tick=tick,
+        )
+        memory.cargo_lane = lane
+        lane.startup_pending_ids.discard(owner_id or "")
+        if lane.startup_pending_ids:
+            lane.phase = "STARTUP_EVACUATION"
+            lane.queued_owner_id = owner_id
+            lane.owner_id = None
+            _select_cargo_lane_departing_worker(
+                lane,
+                workers_by_id,
+                blocked | danger_cells,
+                friendly_occupancy,
+            )
+
+    lane = memory.cargo_lane
+    lane.startup_pending_ids.intersection_update(workers_by_id)
+    for worker_id in tuple(lane.startup_pending_ids):
+        worker = workers_by_id[worker_id]
+        position = _position(getattr(worker, "position", None))
+        if (
+            int(getattr(worker, "cargo", 0)) > 0
+            or position is None
+            or _cargo_lane_egress_complete(
+                position,
+                lane,
+                blocked | danger_cells,
+                friendly_occupancy,
+            )
+        ):
+            lane.startup_pending_ids.discard(worker_id)
+
+    departing = workers_by_id.get(lane.departing_worker_id or "")
+    departing_position = _position(getattr(departing, "position", None))
+    if lane.departing_worker_id is not None and (
+        departing is None
+        or int(getattr(departing, "cargo", 0)) > 0
+        or departing_position is None
+    ):
+        lane.startup_pending_ids.discard(lane.departing_worker_id)
+        lane.departing_worker_id = None
+        lane.egress_path = ()
+        lane.egress_target = None
+    elif (
+        departing_position is not None
+        and _cargo_lane_egress_complete(
+            departing_position,
+            lane,
+            blocked | danger_cells,
+            friendly_occupancy,
+        )
+    ):
+        lane.startup_pending_ids.discard(lane.departing_worker_id or "")
+        lane.departing_worker_id = None
+        lane.egress_path = ()
+        lane.egress_target = None
+
+    owner = workers_by_id.get(lane.owner_id or "")
     owner_position = _position(getattr(owner, "position", None))
     owner_has_cargo = owner is not None and int(getattr(owner, "cargo", 0)) > 0
-    if lane.active and owner is not None and not owner_has_cargo:
-        if owner_position in set(lane.path):
-            lane.yield_worker_ids.add(str(getattr(owner, "id", "")))
+    if owner is not None and not owner_has_cargo:
+        departing_id = str(getattr(owner, "id", ""))
+        lane.departing_worker_id = departing_id
         lane.owner_id = None
+        lane.phase = "EGRESS"
+        lane.egress_path = ()
+        lane.egress_target = None
         owner = None
-    elif lane.active and owner is None:
+    elif lane.owner_id is not None and owner is None:
         lane.owner_id = None
 
+    if lane.departing_worker_id is not None:
+        departing = workers_by_id.get(lane.departing_worker_id)
+        departing_position = _position(getattr(departing, "position", None))
+        if departing_position is not None and (
+            not lane.egress_path or departing_position not in lane.egress_path
+        ):
+            route = _cargo_lane_egress_route(
+                departing_position,
+                lane,
+                blocked | danger_cells,
+                friendly_occupancy,
+            )
+            if route is not None:
+                lane.egress_path = route
+                lane.egress_target = route[-1]
+
+    if lane.startup_pending_ids and lane.departing_worker_id is None:
+        _select_cargo_lane_departing_worker(
+            lane,
+            workers_by_id,
+            blocked | danger_cells,
+            friendly_occupancy,
+        )
+
+    if lane.departing_worker_id is not None or lane.startup_pending_ids:
+        lane.phase = (
+            "STARTUP_EVACUATION" if lane.startup_pending_ids else "EGRESS"
+        )
+        lane.owner_id = None
+    elif lane.owner_id is None and cargo_workers and core_accepts_delivery:
+        queued_owner = workers_by_id.get(lane.queued_owner_id or "")
+        queued_position = _position(getattr(queued_owner, "position", None))
+        queued_route = (
+            _complete_route(queued_position, lane.gateway, blocked)
+            if queued_position is not None and lane.gateway is not None
+            else None
+        )
+        if (
+            queued_owner is None
+            or int(getattr(queued_owner, "cargo", 0)) <= 0
+            or queued_route is None
+            or queued_route.status != "SUCCESS"
+        ):
+            queued_owner, queued_route = _select_cargo_lane_owner(
+                cargo_workers,
+                lane.gateway,
+                blocked,
+                memory,
+                onward_steps=max(0, len(lane.path) - 1),
+            )
+        lane.owner_id = (
+            str(getattr(queued_owner, "id", ""))
+            if queued_owner is not None
+            else None
+        )
+        lane.queued_owner_id = None
+        lane.phase = "INBOUND"
+
     queued_owner = (
-        workers_by_id.get(lane.queued_owner_id or "") if lane.active else None
+        workers_by_id.get(lane.queued_owner_id or "")
     )
     if (
         queued_owner is None
@@ -3751,107 +4138,21 @@ def _update_cargo_lane(
         lane.queued_owner_id = None
         queued_owner = None
 
-    needs_owner = not lane.active or lane.owner_id is None
-    should_activate = memory.core_pocket.blocked or lane.active
-    if needs_owner and should_activate:
-        reuse_existing_bridge = bool(
-            lane.active and lane.path and lane.gateway is not None
-        )
-        selection_target = lane.gateway if reuse_existing_bridge else core_position
-        assert selection_target is not None
-        selection_route = None
-        if reuse_existing_bridge and queued_owner is not None:
-            queued_position = _position(getattr(queued_owner, "position", None))
-            if queued_position is not None:
-                queued_route = _complete_route(
-                    queued_position,
-                    selection_target,
-                    blocked,
-                )
-                if queued_route.status == "SUCCESS":
-                    owner = queued_owner
-                    selection_route = queued_route
-                    lane.queued_owner_id = None
-        if owner is None or selection_route is None:
-            owner, selection_route = _select_cargo_lane_owner(
-                cargo_workers,
-                selection_target,
-                blocked,
-                memory,
-                onward_steps=(
-                    len(lane.path) - 1 if reuse_existing_bridge else 0
-                ),
-            )
-        if owner is None or selection_route is None:
-            _clear_cargo_lane(memory)
-            return memory.cargo_lane
-        owner_id = str(getattr(owner, "id", ""))
-        if reuse_existing_bridge:
-            lane.owner_id = owner_id
-            lane.stage_targets.pop(owner_id, None)
-        else:
-            static_route = selection_route
-            bridge = _local_cargo_lane_bridge(
-                core_position,
-                owner,
-                static_route.path,
-                blocked,
-                danger_cells,
-                getattr(turn, "units", ()),
-            )
-            if bridge is None:
-                _clear_cargo_lane(memory)
-                return memory.cargo_lane
-            lane = CargoLanePlan(
-                active=True,
-                core_position=core_position,
-                owner_id=owner_id,
-                path=bridge.path,
-                gateway=bridge.gateway,
-                started_tick=(
-                    tick if not memory.cargo_lane.active else lane.started_tick
-                ),
-                last_planned_tick=tick,
-            )
-            memory.cargo_lane = lane
-
-    if not memory.cargo_lane.active:
-        return memory.cargo_lane
-
-    lane = memory.cargo_lane
     if any(position in blocked or position in danger_cells for position in lane.path):
-        owner = workers_by_id.get(lane.owner_id or "")
-        owner_position = _position(getattr(owner, "position", None))
-        if owner is None or owner_position is None:
-            _clear_cargo_lane(memory)
-            return memory.cargo_lane
-        static_route = _complete_route(owner_position, core_position, blocked)
-        if static_route.status != "SUCCESS":
-            _clear_cargo_lane(memory)
-            return memory.cargo_lane
-        bridge = _local_cargo_lane_bridge(
-            core_position,
-            owner,
-            static_route.path,
-            blocked,
-            danger_cells,
-            getattr(turn, "units", ()),
-        )
-        if bridge is None:
-            _clear_cargo_lane(memory)
-            return memory.cargo_lane
-        lane.path = bridge.path
-        lane.gateway = bridge.gateway
-        lane.last_planned_tick = tick
+        _clear_cargo_lane(memory)
+        return memory.cargo_lane
 
     active_owner = workers_by_id.get(lane.owner_id or "")
     active_owner_position = _position(getattr(active_owner, "position", None))
     owner_ready_for_queue = bool(
-        active_owner_position in set(lane.path)
-        or (
-            active_owner_position is not None
-            and lane.gateway is not None
-            and _manhattan(active_owner_position, lane.gateway) == 1
+        lane.phase in {"INBOUND", "DEPOSIT"}
+        and (
+            active_owner_position in set(lane.path)
+            or (
+                active_owner_position is not None
+                and lane.gateway is not None
+                and _manhattan(active_owner_position, lane.gateway) == 1
+            )
         )
     )
     if not owner_ready_for_queue:
@@ -3889,6 +4190,17 @@ def _update_cargo_lane(
                 else None
             )
 
+    if active_owner_position == core_position:
+        lane.phase = "DEPOSIT"
+
+    if (
+        not cargo_workers
+        and lane.departing_worker_id is None
+        and not lane.startup_pending_ids
+    ):
+        _clear_cargo_lane(memory)
+        return memory.cargo_lane
+
     _refresh_cargo_lane_occupants(
         turn,
         memory,
@@ -3918,12 +4230,16 @@ def _queue_worker_route(
         reservations,
         actor_origin=origin,
     )
-    if memory.cargo_lane.active and worker_id != memory.cargo_lane.owner_id:
+    if memory.cargo_lane.active and worker_id not in {
+        memory.cargo_lane.owner_id,
+        memory.cargo_lane.departing_worker_id,
+    }:
         gateway = memory.cargo_lane.gateway
         gateway_was_available = bool(
             gateway is not None and gateway not in capacity_blocked
         )
         capacity_blocked.update(memory.cargo_lane.path)
+        capacity_blocked.update(memory.cargo_lane.egress_path)
         if memory.cargo_lane.core_position is not None:
             capacity_blocked.update(
                 _next_position(memory.cargo_lane.core_position, direction)
@@ -5478,6 +5794,46 @@ def _queue_cargo_lane_owner_step(
     return True
 
 
+def _queue_cargo_lane_egress_step(
+    worker: Any,
+    lane: CargoLanePlan,
+    blocked: set[Position],
+    reservations: Any,
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+) -> bool:
+    origin = _position(getattr(worker, "position", None))
+    worker_id = str(getattr(worker, "id", ""))
+    if origin is None or not worker_id or not lane.egress_path:
+        return False
+    try:
+        path_index = lane.egress_path.index(origin)
+    except ValueError:
+        return False
+    if path_index + 1 >= len(lane.egress_path):
+        return False
+    destination = lane.egress_path[path_index + 1]
+    capacity_blocked = _unit_capacity_blocked(
+        friendly_occupancy,
+        reservations,
+        actor_origin=origin,
+    )
+    if destination in blocked or destination in capacity_blocked:
+        memory.route_diagnostics[worker_id] = (
+            "CAPACITY_BLOCKED"
+            if destination in capacity_blocked
+            else "CARGO_LANE_BLOCKED"
+        )
+        return False
+    direction = _direction_between(origin, destination)
+    if direction is None:
+        return False
+    _reserve_destination(reservations, destination)
+    worker.move(direction)
+    memory.note_worker_move(worker_id, destination)
+    return True
+
+
 def _update_core_lane_clearance(
     workers: list[Any],
     core_position: Position | None,
@@ -5487,6 +5843,10 @@ def _update_core_lane_clearance(
     memory: TacticMemory,
 ) -> None:
     workers_by_id = {str(getattr(worker, "id", "")): worker for worker in workers}
+    if memory.cargo_lane.active:
+        memory.core_lane_departing_worker_id = None
+        memory.core_lane_yield_worker_ids.clear()
+        return
     if core_position is None or not core_accepts_delivery:
         memory.core_lane_departing_worker_id = None
         memory.core_lane_yield_worker_ids.clear()
@@ -5677,14 +6037,20 @@ def _plan_workers(
             (
                 0
                 if str(getattr(worker, "id", ""))
-                == memory.core_lane_departing_worker_id
+                == memory.cargo_lane.departing_worker_id
                 else 1
                 if str(getattr(worker, "id", ""))
-                in memory.cargo_lane.yield_worker_ids
+                in memory.cargo_lane.startup_pending_ids
                 else 2
                 if str(getattr(worker, "id", ""))
-                == memory.cargo_lane.owner_id
+                in memory.cargo_lane.yield_worker_ids
                 else 3
+                if str(getattr(worker, "id", ""))
+                == memory.cargo_lane.owner_id
+                else 4
+                if str(getattr(worker, "id", ""))
+                == memory.core_lane_departing_worker_id
+                else 5
             ),
             str(getattr(worker, "id", "")),
         ),
@@ -5757,6 +6123,28 @@ def _plan_workers(
                 worker.wait()
                 continue
 
+        lane = memory.cargo_lane
+        if (
+            lane.active
+            and worker_key == lane.departing_worker_id
+            and worker_position is not None
+        ):
+            moved = _queue_cargo_lane_egress_step(
+                worker,
+                lane,
+                worker_return_blocked | contested_positions,
+                reserved_destinations,
+                friendly_occupancy,
+                memory,
+            )
+            if not moved:
+                worker.wait()
+            continue
+
+        if lane.active and worker_key in lane.startup_pending_ids:
+            worker.wait()
+            continue
+
         if (
             worker_key == memory.core_lane_departing_worker_id
             and worker_position is not None
@@ -5800,7 +6188,6 @@ def _plan_workers(
             worker.wait()
             continue
 
-        lane = memory.cargo_lane
         if (
             lane.active
             and lane.core_position is not None
@@ -5810,7 +6197,7 @@ def _plan_workers(
             direction = _cargo_lane_yield_direction(
                 worker_position,
                 lane.core_position,
-                set(lane.path),
+                set(lane.path) | set(lane.egress_path),
                 worker_return_blocked | contested_positions,
                 reserved_destinations,
                 friendly_occupancy,
@@ -6797,6 +7184,11 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         friendly_occupancy,
         memory,
         core_accepts_delivery=core_accepts_delivery,
+        core_stable=bool(
+            core is not None
+            and not _core_is_moving(core)
+            and planned_core_move is None
+        ),
         threat_level=threat.level,
     )
 
@@ -6851,6 +7243,7 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
             _chebyshev_ring_positions(core_position, 1)
         )
         core_logistics_apron.update(memory.cargo_lane.path)
+        core_logistics_apron.update(memory.cargo_lane.egress_path)
         core_logistics_apron.update(memory.cargo_lane.stage_targets.values())
         core_logistics_apron.discard(core_position)
     core_logistics_apron.update(memory.planned_worker_destinations.values())

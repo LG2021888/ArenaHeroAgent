@@ -21,6 +21,7 @@ from arena_agent import (
     MOVE_CONTESTED_AVOID_TICKS,
     MOVE_OCCUPIED_AVOID_TICKS,
     CoreRaidPlan,
+    CargoLanePlan,
     EnemyCoreObservation,
     _assign_guard_posts,
     _assign_raid_positions,
@@ -28,6 +29,8 @@ from arena_agent import (
     _cached_worker_route_step,
     _choose_spawn_unit,
     _complete_route,
+    _cargo_lane_egress_complete,
+    _cargo_lane_startup_workers,
     _core_escape_direction,
     _friendly_cell_occupancy,
     _raid_target_durability,
@@ -45,8 +48,10 @@ from arena_agent import (
     _submit_turn_with_retry,
     _trace_event,
     _update_core_pocket,
+    _single_open_cargo_lane_path,
     _unit_cost,
     _worker_escape_direction,
+    _worker_mode,
     choose_step_direction,
     plan_turn,
 )
@@ -2326,6 +2331,41 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertEqual(second.consecutive_ticks, 2)
         self.assertTrue(second.blocked)
 
+    def test_active_cargo_lane_suppresses_controller_induced_pocket(self):
+        first_turn, second_turn, first_obstacles, second_obstacles = (
+            make_blocked_pocket_snapshots(self.POCKET_GUARDS)
+        )
+        memory = TacticMemory(
+            cargo_lane=CargoLanePlan(
+                active=True,
+                core_position=(-217, 665),
+                path=((-217, 665), (-217, 664), (-216, 664), (-215, 664)),
+                gateway=(-215, 664),
+            )
+        )
+
+        first = _update_core_pocket(
+            first_turn,
+            (-217, 665),
+            first_obstacles,
+            _friendly_cell_occupancy(first_turn),
+            memory,
+            core_accepts_delivery=True,
+        )
+        second = _update_core_pocket(
+            second_turn,
+            (-217, 665),
+            second_obstacles,
+            _friendly_cell_occupancy(second_turn),
+            memory,
+            core_accepts_delivery=True,
+        )
+
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
+        self.assertEqual(second.consecutive_ticks, 0)
+        self.assertFalse(second.blocked)
+
     def test_real_pocket_lane_delivers_all_cargo_without_move_contention(self):
         turn_89474, turn, obstacles_89474, _ = make_blocked_pocket_snapshots(
             self.POCKET_GUARDS
@@ -2343,7 +2383,7 @@ class ArenaAgentTests(unittest.TestCase):
 
         deposit_ticks = []
         deposit_ids = []
-        queued_ready_at_deposit = []
+        deposit_egress_ids = []
         lane_history = []
         config = AgentConfig(spawn_unit_type=None)
         for _ in range(96):
@@ -2353,8 +2393,10 @@ class ArenaAgentTests(unittest.TestCase):
             lane_history.append(
                 (
                     action_tick,
+                    memory.cargo_lane.phase,
                     memory.cargo_lane.owner_id,
                     memory.cargo_lane.queued_owner_id,
+                    memory.cargo_lane.departing_worker_id,
                     (
                         workers_by_id[memory.cargo_lane.owner_id].position
                         if memory.cargo_lane.owner_id in workers_by_id
@@ -2396,20 +2438,7 @@ class ArenaAgentTests(unittest.TestCase):
             if deposited:
                 deposit_ticks.extend([action_tick] * len(deposited))
                 deposit_ids.extend(deposited)
-                queued_id = memory.cargo_lane.queued_owner_id
-                workers_after_actions = {
-                    str(worker.id): worker for worker in turn.workers
-                }
-                queued_ready_at_deposit.extend(
-                    [
-                        bool(
-                            queued_id in workers_after_actions
-                            and workers_after_actions[queued_id].position
-                            == memory.cargo_lane.gateway
-                        )
-                    ]
-                    * len(deposited)
-                )
+                deposit_egress_ids.extend(deposited)
             if len(deposit_ids) == 7:
                 break
 
@@ -2434,25 +2463,22 @@ class ArenaAgentTests(unittest.TestCase):
             current - previous
             for previous, current in zip(deposit_ticks, deposit_ticks[1:])
         ]
-        steady_intervals = [
-            interval
-            for interval, queued_ready in zip(
-                intervals,
-                queued_ready_at_deposit,
-            )
-            if queued_ready
-        ]
-        self.assertGreaterEqual(
-            len(steady_intervals),
-            4,
-            f"deposit_ticks={deposit_ticks}, queued={queued_ready_at_deposit}",
-        )
         self.assertTrue(
-            all(interval <= 4 for interval in steady_intervals),
+            all(7 <= interval <= 14 for interval in intervals),
             f"deposit_ticks={deposit_ticks}, intervals={intervals}, "
-            f"queued={queued_ready_at_deposit}, "
             f"history={lane_history}",
         )
+        for deposited_id, deposit_tick in zip(deposit_egress_ids[:-1], deposit_ticks):
+            following = [
+                row
+                for row in lane_history
+                if row[0] > deposit_tick and row[4] == deposited_id
+            ]
+            self.assertTrue(following, f"missing egress for {deposited_id}")
+            self.assertTrue(
+                all(row[2] is None for row in following),
+                f"new owner admitted before {deposited_id} egressed: {following}",
+            )
 
     def test_stalled_admitted_cargo_stops_suppressing_pocket(self):
         cargo = FakeActor("cargo", (0, -1), cargo=1)
@@ -3079,50 +3105,141 @@ class ArenaAgentTests(unittest.TestCase):
         turn.state.population = 2
         memory = TacticMemory()
         config = AgentConfig(spawn_unit_type=None)
+        history = []
+        deposit_tick = None
+        for _ in range(24):
+            action_tick = turn.tick
+            plan_turn(turn, memory, config)
+            history.append(
+                (
+                    action_tick,
+                    memory.cargo_lane.phase,
+                    memory.cargo_lane.owner_id,
+                    memory.cargo_lane.departing_worker_id,
+                    cargo.position,
+                    empty.position,
+                    _worker_mode(cargo, memory, action_tick),
+                    _worker_mode(empty, memory, action_tick),
+                )
+            )
+            if memory.cargo_lane.phase == "STARTUP_EVACUATION":
+                self.assertNotEqual(cargo.position, core.position)
+            _, deposited = apply_synchronous_actions(turn)
+            if deposited:
+                deposit_tick = action_tick
+            if deposit_tick is not None and not memory.cargo_lane.active:
+                break
 
-        plan_turn(turn, memory, config)
+        self.assertIsNotNone(deposit_tick, f"history={history}")
+        startup_rows = [row for row in history if row[1] == "STARTUP_EVACUATION"]
+        self.assertTrue(startup_rows, f"history={history}")
+        self.assertTrue(
+            any(row[7] == "CARGO_LANE_EGRESS" for row in startup_rows),
+            f"history={history}",
+        )
+        first_inbound = next(row for row in history if row[1] == "INBOUND")
+        self.assertLessEqual(first_inbound[5][0], -4, f"history={history}")
+        self.assertTrue(
+            all(row[4] != core.position for row in history if row[0] < first_inbound[0]),
+            f"history={history}",
+        )
+        self.assertTrue(
+            any(
+                row[0] > deposit_tick and row[6] == "CARGO_LANE_EGRESS"
+                for row in history
+            ),
+            f"history={history}",
+        )
 
-        self.assertEqual(cargo.actions, [("MOVE", Direction.UP)])
-        self.assertEqual(empty.actions, [("WAIT",)])
+    def test_cargo_lane_dead_pocket_is_not_egress_complete(self):
+        lane = CargoLanePlan(
+            active=True,
+            core_position=(0, 0),
+            path=((0, 0), (1, 0), (2, 0), (3, 0)),
+            gateway=(3, 0),
+        )
+        blocked = {(0, -1), (-1, 0), (0, 1), (1, -1), (1, 1), (2, 0)}
 
-        cargo.position = (-1, -1)
-        cargo.actions.clear()
-        empty.actions.clear()
-        turn.tick += 1
-        plan_turn(turn, memory, config)
+        self.assertFalse(
+            _cargo_lane_egress_complete(
+                (1, 0),
+                lane,
+                blocked,
+                {(1, 0): 1},
+            )
+        )
+        self.assertTrue(
+            _cargo_lane_egress_complete(
+                (4, 0),
+                lane,
+                blocked,
+                {(4, 0): 1},
+            )
+        )
 
-        self.assertEqual(cargo.actions, [("WAIT",)])
-        self.assertEqual(empty.actions, [("MOVE", Direction.LEFT)])
+    def test_tick_93715_detects_right_lane_and_seven_startup_workers(self):
+        core_position = (-217, 666)
+        obstacles = {
+            (-223, 669), (-221, 662), (-221, 670), (-220, 664),
+            (-220, 666), (-219, 659), (-219, 665), (-219, 669),
+            (-217, 670), (-216, 665), (-216, 671), (-215, 659),
+            (-215, 665), (-215, 670), (-214, 672), (-213, 659),
+            (-213, 660), (-213, 663), (-212, 666), (-212, 670),
+            (-211, 661), (-211, 668), (-211, 669),
+        }
+        worker_specs = (
+            ("0f13adab", (-213, 662), 1),
+            ("57606495", (-212, 658), 0),
+            ("626fe5a3", (-217, 664), 0),
+            ("656d3944", (-219, 666), 0),
+            ("6e8fe8f1", (-217, 665), 0),
+            ("9a2a356b", (-216, 667), 0),
+            ("cee8bd78", (-218, 665), 0),
+            ("dd996335", (-217, 667), 0),
+            ("f0c09f3e", (-218, 667), 0),
+        )
+        guard_specs = (
+            ("3df43662", (-216, 668)), ("3f0bd5b9", (-218, 664)),
+            ("4da07eb7", (-215, 667)), ("6a24bb5a", (-218, 662)),
+            ("70f06c55", (-215, 662)), ("fb8b4510", (-215, 664)),
+            ("23f6dad8", (-217, 668)), ("3059ebff", (-214, 667)),
+            ("3f55a749", (-218, 668)), ("4a49109c", (-216, 664)),
+            ("5ee3e17e", (-217, 663)), ("7e94b747", (-215, 663)),
+            ("839247ac", (-216, 663)), ("c1c37a0a", (-219, 667)),
+            ("e2790ccf", (-219, 668)),
+        )
+        turn = make_pocket_snapshot(93715, obstacles, worker_specs, guard_specs)
+        turn.core.position = core_position
+        occupancy = _friendly_cell_occupancy(turn)
 
-        empty.position = (-1, 0)
-        cargo.actions.clear()
-        empty.actions.clear()
-        turn.tick += 1
-        plan_turn(turn, memory, config)
+        path = _single_open_cargo_lane_path(
+            core_position,
+            obstacles,
+            occupancy,
+        )
+        startup_ids = _cargo_lane_startup_workers(turn.workers, core_position)
 
-        self.assertEqual(cargo.actions, [("WAIT",)])
-        self.assertEqual(empty.actions, [("MOVE", Direction.DOWN)])
+        self.assertEqual(
+            path,
+            ((-217, 666), (-216, 666), (-215, 666), (-214, 666)),
+        )
+        self.assertEqual(
+            startup_ids,
+            {
+                "626fe5a3", "656d3944", "6e8fe8f1", "9a2a356b",
+                "cee8bd78", "dd996335", "f0c09f3e",
+            },
+        )
 
-        empty.position = (-1, 1)
-        cargo.actions.clear()
-        empty.actions.clear()
-        turn.tick += 1
-        plan_turn(turn, memory, config)
-        self.assertEqual(cargo.actions, [("MOVE", Direction.DOWN)])
+        for worker in turn.workers:
+            worker.cargo = 0
+        memory = TacticMemory()
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
 
-        cargo.position = (-1, 0)
-        cargo.actions.clear()
-        empty.actions.clear()
-        turn.tick += 1
-        plan_turn(turn, memory, config)
-        self.assertEqual(cargo.actions, [("MOVE", Direction.RIGHT)])
-
-        cargo.position = (0, 0)
-        cargo.actions.clear()
-        empty.actions.clear()
-        turn.tick += 1
-        plan_turn(turn, memory, config)
-        self.assertEqual(cargo.actions, [("DEPOSIT",)])
+        self.assertTrue(memory.cargo_lane.active)
+        self.assertEqual(memory.cargo_lane.phase, "STARTUP_EVACUATION")
+        self.assertIsNone(memory.cargo_lane.owner_id)
+        self.assertEqual(memory.cargo_lane.startup_pending_ids, startup_ids)
 
     def test_occupied_core_clears_even_when_another_exit_is_free(self):
         cargo = FakeActor("a-cargo", (0, 1), cargo=1)
