@@ -42,8 +42,11 @@ python .\arena_agent.py --max-turns 1
 
 可用参数：
 
-- `--max-population 30`：本策略的生产上限；游戏本身没有人口上限。传入 `0` 表示策略不设置人口上限。
+- `--max-population 0`：本策略的生产硬上限；默认 `0` 表示不设置硬上限。可选扩容仍由独立开关和资源门槛控制。
 - 默认先恢复 `12 Worker + 3 Vanguard + 4 Ranger = 19` 基础阵容，再按 Worker、Vanguard、Ranger 顺序扩容到 `16 + 6 + 8 = 30`；也可以用 `--worker-target`、`--vanguard-target`、`--ranger-target` 调整最终目标。
+- `--population-expansion ON|OFF`：默认 `OFF`，达到配置阵容后保持当前人口；设为 `ON` 后按 `Worker:Vanguard:Ranger = 8:3:4` 继续扩容。
+- `--expansion-threshold 150`：可选扩容的基础资源门槛。实际门槛为 `max(该值, 当前容量 - 5 × 战损缓冲单位数)`。
+- `--expansion-casualty-buffer 6`：默认保留 6 个单位的战损容量余量；`--max-population` 为正数时仍优先执行硬上限。
 - 生产价格由 SDK `unit_cost(UnitType, population)` 按生产前的当前存活人口 `N` 计算：`N <= 19` 使用基础价，`N = 20–24` 使用第一档涨价，`N = 25–29` 使用第二档涨价；没有每 Tick 自动维护费。
 - `--spawn-unit AUTO|WORKER|VANGUARD|RANGER`：默认 `AUTO` 按编队目标生产，指定单位名称后强制只生产该类型。
 - `--beacon-policy RETREAT|HOLD`：默认 `RETREAT`，Beacon 在 Core 近距离可见时让 Core 逐步离开；`HOLD` 保持当前位置。
@@ -69,7 +72,7 @@ python .\arena_agent.py --max-turns 1
 - 敌方 Vanguard/Ranger 进入 Worker 近距离后，Worker 会先撤离，并避开 Vanguard 邻格和 Ranger 三格射线；敌方 Worker/Core 不会触发战斗撤退。
 - 远程空载 Worker 遇到敌方战斗单位后进入 `EVADE -> RETURN -> COOLDOWN -> SCOUT`：先回到 Core 附近，冷却 3 Tick，再恢复探索，不会马上重走旧路线；Trace 会将这段明确记录为 `SCOUT_RETURN`，不与探索停滞混淆。
 - Worker 死亡产生的 `WORKER_CARGO_DROPPED` 会进入高优先级资源记忆，附近空载 Worker 会优先回收；资源耗尽或超过记忆 TTL 后自动清除。
-- 生产策略先生产 4 个 Worker，再补 1 个 Vanguard 和 1 个 Ranger 建立最低防线；随后恢复 `12/3/4` 基础阵容，再按 Worker、Vanguard、Ranger 顺序扩容到 `16/6/8`。最低防线前不保留生产储备，基础阵容阶段保留 10 资源，扩容阶段保留 15 资源；战斗敌人进入警戒范围后暂停非必要生产，无安全退路且资源足够时可紧急生产防守单位。
+- 生产策略先生产 4 个 Worker，再补 1 个 Vanguard 和 1 个 Ranger 建立最低防线；随后恢复 `12/3/4` 基础阵容，再按 Worker、Vanguard、Ranger 顺序扩容到 `16/6/8`。可选人口扩容默认关闭；开启后仅在有效资源达到动态门槛时按 `8:3:4` 比例继续生产，使资源保持在 150 左右并保留战损容量。最低防线前不保留生产储备，基础阵容阶段保留 10 资源，扩容阶段保留 15 资源；战斗敌人进入警戒范围后暂停非必要生产，无安全退路且资源足够时可紧急生产防守单位。
 - Beacon 处于地面且距离 Core 小于 8 格时，Core 会在没有更高等级威胁时选择增加与 Beacon 距离的合法方向，避免 Core 长时间停在 Beacon 附近。
 - 日常移动会避开已知障碍、敌方占据格和当前可计算的攻击危险格，并在直线路径受阻时尝试局部绕行；普通格最多进入 1 个 Unit，Core 可与 1 个 Unit 同格，已占用或已预留的目的格不会再接收其他 Unit。
 - 障碍位置累积到独立的永久记忆中，用于选择下一步移动方向。

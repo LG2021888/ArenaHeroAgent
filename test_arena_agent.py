@@ -19,26 +19,32 @@ from arena_agent import (
     PATH_COST_UNREACHABLE,
     ROUTE_MAX_EXPANSIONS,
     MOVE_CONTESTED_AVOID_TICKS,
+    MOVE_OCCUPIED_AVOID_TICKS,
     CoreRaidPlan,
     EnemyCoreObservation,
     _assign_guard_posts,
     _assign_raid_positions,
     _chebyshev_ring_positions,
     _cached_worker_route_step,
+    _choose_spawn_unit,
     _complete_route,
     _core_escape_direction,
+    _friendly_cell_occupancy,
     _raid_target_durability,
     _render_turn,
     _estimated_path_cost,
     _is_retryable_protocol_error,
     _is_retryable_api_error,
     _load_tactic_memory,
+    _next_position,
     _parse_stream_message_with_compatibility,
     _parse_args,
+    _queue_move,
     _reconnect_delay,
     _save_tactic_memory,
     _submit_turn_with_retry,
     _trace_event,
+    _update_core_pocket,
     _unit_cost,
     _worker_escape_direction,
     choose_step_direction,
@@ -212,6 +218,145 @@ def make_roster_turn(worker_count, vanguard_count, ranger_count, *, resources):
     return turn, core
 
 
+def make_pocket_snapshot(tick, obstacles, worker_specs, guard_specs):
+    core = FakeActor("core", (-217, 665), shield=5)
+    core.hp = 5
+    workers = tuple(
+        FakeActor(worker_id, position, cargo=cargo)
+        for worker_id, position, cargo in worker_specs
+    )
+    vanguards = tuple(
+        FakeActor(worker_id, position, unit_type=UnitType.VANGUARD)
+        for worker_id, position in guard_specs[:6]
+    )
+    rangers = tuple(
+        FakeActor(worker_id, position, unit_type=UnitType.RANGER)
+        for worker_id, position in guard_specs[6:]
+    )
+    turn = make_turn(worker=workers[0], core=core, obstacles=frozenset(obstacles))
+    turn.tick = tick
+    turn.workers = workers
+    turn.vanguards = vanguards
+    turn.rangers = rangers
+    turn.units = workers + vanguards + rangers
+    turn.state.population = len(turn.units)
+    return turn
+
+
+def apply_synchronous_actions(turn):
+    """Apply FakeActor actions with the server's no-swap Unit occupancy rule."""
+
+    occupied = {
+        actor.position: str(actor.id)
+        for actor in turn.units
+        if actor.position is not None
+    }
+    moves = {}
+    destination_owners = {}
+    deposit_ids = []
+    for actor in turn.units:
+        move_actions = [action for action in actor.actions if action[0] == "MOVE"]
+        if len(move_actions) > 1:
+            raise AssertionError(f"multiple moves for {actor.id}: {move_actions}")
+        if move_actions:
+            destination = _next_position(actor.position, move_actions[0][1])
+            previous_owner = destination_owners.get(destination)
+            if previous_owner is not None:
+                raise AssertionError(
+                    f"contested destination {destination}: "
+                    f"{previous_owner} and {actor.id}"
+                )
+            occupying_id = occupied.get(destination)
+            if occupying_id is not None and occupying_id != str(actor.id):
+                raise AssertionError(
+                    f"{actor.id} enters occupied {destination} held by {occupying_id}"
+                )
+            destination_owners[destination] = str(actor.id)
+            moves[str(actor.id)] = destination
+        if any(action[0] == "DEPOSIT" for action in actor.actions):
+            deposit_ids.append(str(actor.id))
+
+    actors_by_id = {str(actor.id): actor for actor in turn.units}
+    for actor_id, destination in moves.items():
+        actors_by_id[actor_id].position = destination
+    for actor_id in deposit_ids:
+        actors_by_id[actor_id].cargo = 0
+    turn.resources += len(deposit_ids)
+    turn.tick += 1
+    turn.events = tuple(
+        SimpleNamespace(
+            event_type="DEPOSIT_SUCCEEDED",
+            reason_code=None,
+            actor_id=actor_id,
+            target_id=str(turn.core.id),
+            position=turn.core.position,
+        )
+        for actor_id in deposit_ids
+    )
+    for actor in (*turn.units, turn.core):
+        actor.actions.clear()
+    return moves, tuple(deposit_ids)
+
+
+def make_blocked_pocket_snapshots(guard_specs):
+    workers_89474 = (
+        ("0f13adab", (-222, 661), 1),
+        ("626fe5a3", (-214, 690), 0),
+        ("6553c3ed", (-211, 665), 1),
+        ("656d3944", (-217, 664), 0),
+        ("8bb2ffda", (-217, 649), 1),
+        ("9a2a356b", (-210, 637), 0),
+        ("a975bdda", (-214, 655), 0),
+        ("b722cb72", (-217, 666), 0),
+        ("b865048a", (-216, 666), 0),
+        ("c3ca0560", (-212, 702), 1),
+        ("ca727ec5", (-216, 663), 0),
+        ("cee8bd78", (-213, 664), 1),
+        ("d3139ba8", (-216, 659), 0),
+        ("dd996335", (-215, 661), 1),
+        ("f0c09f3e", (-217, 657), 1),
+    )
+    workers_89475 = (
+        ("0f13adab", (-221, 661), 1),
+        ("626fe5a3", (-214, 691), 0),
+        ("6553c3ed", (-212, 665), 1),
+        ("656d3944", (-216, 664), 0),
+        ("8bb2ffda", (-217, 650), 1),
+        ("9a2a356b", (-210, 637), 0),
+        ("a975bdda", (-214, 654), 0),
+        ("b722cb72", (-217, 666), 0),
+        ("b865048a", (-216, 666), 0),
+        ("c3ca0560", (-212, 701), 1),
+        ("ca727ec5", (-216, 663), 0),
+        ("cee8bd78", (-213, 665), 1),
+        ("d3139ba8", (-216, 658), 0),
+        ("dd996335", (-215, 660), 1),
+        ("f0c09f3e", (-217, 656), 1),
+    )
+    obstacles_89474 = {
+        (-225, 667), (-223, 669), (-221, 660), (-221, 662),
+        (-221, 670), (-220, 664), (-220, 666), (-219, 657),
+        (-219, 659), (-219, 665), (-219, 669), (-217, 670),
+        (-216, 665), (-216, 671), (-215, 659), (-215, 665),
+        (-215, 670), (-213, 660), (-213, 663), (-212, 666),
+        (-211, 661), (-211, 668), (-210, 666),
+    }
+    obstacles_89475 = {
+        (-225, 667), (-223, 669), (-221, 660), (-221, 662),
+        (-221, 670), (-220, 664), (-220, 666), (-219, 659),
+        (-219, 665), (-219, 669), (-217, 670), (-216, 665),
+        (-216, 671), (-215, 659), (-215, 665), (-215, 670),
+        (-213, 659), (-213, 660), (-213, 663), (-212, 666),
+        (-211, 661), (-211, 668), (-210, 666),
+    }
+    return (
+        make_pocket_snapshot(89474, obstacles_89474, workers_89474, guard_specs),
+        make_pocket_snapshot(89475, obstacles_89475, workers_89475, guard_specs),
+        obstacles_89474,
+        obstacles_89475,
+    )
+
+
 class IdempotencyConflictTurn:
     tick = 45
 
@@ -228,6 +373,24 @@ class IdempotencyConflictTurn:
 
 
 class ArenaAgentTests(unittest.TestCase):
+    POCKET_GUARDS = (
+        ("3df43662", (-216, 667)),
+        ("3f0bd5b9", (-214, 667)),
+        ("6a24bb5a", (-217, 662)),
+        ("70f06c55", (-215, 667)),
+        ("87f1d6a2", (-214, 666)),
+        ("fb8b4510", (-214, 661)),
+        ("23f6dad8", (-220, 667)),
+        ("3059ebff", (-218, 664)),
+        ("3b92991a", (-217, 667)),
+        ("4a49109c", (-218, 667)),
+        ("5ee3e17e", (-219, 667)),
+        ("7e94b747", (-220, 663)),
+        ("839247ac", (-219, 662)),
+        ("8527c65c", (-218, 662)),
+        ("e2790ccf", (-220, 662)),
+    )
+
     def test_transport_retry_reuses_idempotency_key(self):
         turn = FlakyTurn()
 
@@ -302,6 +465,22 @@ class ArenaAgentTests(unittest.TestCase):
         args = _parse_args(["--max-reconnect-attempts", "2"])
 
         self.assertEqual(args.max_reconnect_attempts, 2)
+
+    def test_population_expansion_arguments_are_configurable(self):
+        args = _parse_args(
+            [
+                "--population-expansion",
+                "ON",
+                "--expansion-threshold",
+                "153",
+                "--expansion-casualty-buffer",
+                "7",
+            ]
+        )
+
+        self.assertEqual(args.population_expansion, "ON")
+        self.assertEqual(args.expansion_threshold, 153)
+        self.assertEqual(args.expansion_casualty_buffer, 7)
 
     def test_tactic_memory_persists_safe_map_observations(self):
         memory = TacticMemory(
@@ -935,7 +1114,10 @@ class ArenaAgentTests(unittest.TestCase):
     def test_default_roster_targets_are_sixteen_six_eight(self):
         config = AgentConfig()
 
-        self.assertEqual(config.max_population, 30)
+        self.assertEqual(config.max_population, 0)
+        self.assertFalse(config.population_expansion_enabled)
+        self.assertEqual(config.expansion_resource_threshold, 150)
+        self.assertEqual(config.expansion_casualty_buffer_units, 6)
         self.assertEqual(config.worker_target, 16)
         self.assertEqual(config.vanguard_target, 6)
         self.assertEqual(config.ranger_target, 8)
@@ -1245,6 +1427,60 @@ class ArenaAgentTests(unittest.TestCase):
         plan_turn(turn, TacticMemory(), AgentConfig())
 
         self.assertEqual(core.actions, [("WAIT",)])
+
+    def test_optional_population_expansion_waits_for_resource_threshold(self):
+        turn, _ = make_roster_turn(16, 6, 8, resources=149)
+        config = AgentConfig(population_expansion_enabled=True)
+
+        self.assertIsNone(_choose_spawn_unit(turn, config))
+
+        turn.resources = 150
+        self.assertEqual(_choose_spawn_unit(turn, config), UnitType.WORKER)
+
+    def test_optional_population_expansion_uses_same_tick_delivery(self):
+        turn, _ = make_roster_turn(16, 6, 8, resources=149)
+        config = AgentConfig(population_expansion_enabled=True)
+
+        self.assertEqual(
+            _choose_spawn_unit(turn, config, pending_delivery=1),
+            UnitType.WORKER,
+        )
+
+    def test_optional_population_expansion_respects_finite_hard_cap(self):
+        turn, _ = make_roster_turn(16, 6, 9, resources=153)
+        config = AgentConfig(
+            max_population=31,
+            population_expansion_enabled=True,
+        )
+
+        self.assertIsNone(_choose_spawn_unit(turn, config))
+
+    def test_optional_population_expansion_follows_eight_three_four_ratio(self):
+        counts = [16, 6, 9]
+        expected = [
+            UnitType.WORKER,
+            UnitType.VANGUARD,
+            UnitType.WORKER,
+            UnitType.WORKER,
+            UnitType.RANGER,
+            UnitType.WORKER,
+            UnitType.VANGUARD,
+            UnitType.WORKER,
+            UnitType.RANGER,
+        ]
+        config = AgentConfig(population_expansion_enabled=True)
+        actual = []
+        for _ in expected:
+            turn, _ = make_roster_turn(*counts, resources=1000)
+            unit_type = _choose_spawn_unit(turn, config)
+            actual.append(unit_type)
+            counts[
+                (UnitType.WORKER, UnitType.VANGUARD, UnitType.RANGER).index(
+                    unit_type
+                )
+            ] += 1
+
+        self.assertEqual(actual, expected)
 
     def test_core_evades_a_close_enemy_before_production_or_repair(self):
         core = FakeActor("core", (0, 0))
@@ -1691,6 +1927,7 @@ class ArenaAgentTests(unittest.TestCase):
     def test_vanguard_sweeps_adjacent_enemy_instead_of_waiting(self):
         core = FakeActor("core", (0, 0))
         vanguard = FakeActor("vanguard", (1, 0), unit_type=UnitType.VANGUARD)
+        vanguard.hp = 4
         enemy = FakeActor("enemy", (2, 0), unit_type=UnitType.VANGUARD)
         turn = make_turn(worker=None, core=core, enemies=(enemy,))
         turn.vanguards = (vanguard,)
@@ -1739,6 +1976,71 @@ class ArenaAgentTests(unittest.TestCase):
         plan_turn(turn, TacticMemory(), AgentConfig(spawn_unit_type=None))
 
         self.assertEqual(ranger.actions, [("SHOOT", "enemy-ranger")])
+
+    def test_one_hp_ranger_uses_safer_exit_instead_of_shooting(self):
+        core = FakeActor("core", (-5, 0))
+        core.hp = 5
+        ranger = FakeActor("ranger", (0, 0), unit_type=UnitType.RANGER)
+        ranger.hp = 1
+        enemy = FakeActor("enemy-ranger", (0, 3), unit_type=UnitType.RANGER)
+        turn = make_turn(worker=None, core=core, enemies=(enemy,))
+        turn.rangers = (ranger,)
+        turn.units = (ranger,)
+        turn.state.population = 1
+
+        plan_turn(turn, TacticMemory(), AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(ranger.actions, [("MOVE", Direction.LEFT)])
+        self.assertFalse(any(action[0] == "SHOOT" for action in ranger.actions))
+
+    def test_two_hp_vanguard_uses_safer_exit_instead_of_sweeping(self):
+        core = FakeActor("core", (-5, 0))
+        core.hp = 5
+        vanguard = FakeActor("vanguard", (0, 0), unit_type=UnitType.VANGUARD)
+        vanguard.hp = 2
+        enemy = FakeActor("enemy-vanguard", (1, 0), unit_type=UnitType.VANGUARD)
+        turn = make_turn(worker=None, core=core, enemies=(enemy,))
+        turn.vanguards = (vanguard,)
+        turn.units = (vanguard,)
+        turn.state.population = 1
+
+        plan_turn(turn, TacticMemory(), AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(vanguard.actions, [("MOVE", Direction.LEFT)])
+        self.assertFalse(any(action[0] == "SWEEP" for action in vanguard.actions))
+
+    def test_critical_units_last_attack_when_no_safer_exit_exists(self):
+        for unit_type, action_name in (
+            (UnitType.VANGUARD, "SWEEP"),
+            (UnitType.RANGER, "SHOOT"),
+        ):
+            with self.subTest(unit_type=unit_type):
+                core = FakeActor("core", (-5, 0))
+                core.hp = 5
+                defender = FakeActor("defender", (0, 0), unit_type=unit_type)
+                defender.hp = 2 if unit_type == UnitType.VANGUARD else 1
+                enemy = FakeActor(
+                    "enemy-vanguard",
+                    (1, 0),
+                    unit_type=UnitType.VANGUARD,
+                )
+                turn = make_turn(
+                    worker=None,
+                    core=core,
+                    enemies=(enemy,),
+                    obstacles=frozenset({(-1, 0), (0, -1), (0, 1)}),
+                )
+                if unit_type == UnitType.VANGUARD:
+                    turn.vanguards = (defender,)
+                else:
+                    turn.rangers = (defender,)
+                turn.units = (defender,)
+                turn.state.population = 1
+
+                plan_turn(turn, TacticMemory(), AgentConfig(spawn_unit_type=None))
+
+                self.assertEqual(defender.actions[0][0], action_name)
+                self.assertFalse(any(action[0] == "MOVE" for action in defender.actions))
 
     def test_damaged_defender_returns_to_core_and_heals_with_backup(self):
         core = FakeActor("core", (0, 0))
@@ -1809,6 +2111,70 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertFalse(any(action[0] == "SHOOT" for action in ranger.actions))
         self.assertEqual(memory.raid.state, "CORE_TARGET_MEMORY")
 
+    def test_vanguard_stationary_clear_moves_to_empty_attack_cell(self):
+        core = FakeActor("core", (10, 10), shield=5)
+        core.hp = 5
+        guard = FakeActor("vanguard-a", (10, 9), unit_type=UnitType.VANGUARD)
+        clearer = FakeActor("vanguard-b", (0, 0), unit_type=UnitType.VANGUARD)
+        guard.hp = clearer.hp = 4
+        enemy = FakeActor("enemy-worker", (2, 0), unit_type=UnitType.WORKER)
+        turn = make_turn(worker=None, core=core, enemies=(enemy,))
+        turn.vanguards = (guard, clearer)
+        turn.units = (guard, clearer)
+        turn.state.population = 2
+        memory = TacticMemory()
+        config = AgentConfig(spawn_unit_type=None)
+
+        plan_turn(turn, memory, config)
+        for unit in turn.units:
+            unit.actions.clear()
+        turn.tick = 11
+        plan_turn(turn, memory, config)
+
+        self.assertEqual(clearer.actions, [("MOVE", Direction.RIGHT)])
+        self.assertEqual(memory.planned_unit_destinations["vanguard-b"], (1, 0))
+        self.assertEqual(memory.planned_unit_targets["vanguard-b"], (1, 0))
+        self.assertEqual(memory.planned_stationary_targets["vanguard-b"], (2, 0))
+
+    def test_stationary_worker_on_enemy_core_is_not_cleared_as_normal_target(self):
+        core = FakeActor("core", (10, 10), shield=5)
+        core.hp = 5
+        guard = FakeActor("vanguard-a", (10, 9), unit_type=UnitType.VANGUARD)
+        clearer = FakeActor("vanguard-b", (1, 0), unit_type=UnitType.VANGUARD)
+        guard.hp = clearer.hp = 4
+        enemy_core = SimpleNamespace(
+            id="enemy-core",
+            position=(2, 0),
+            hp=5,
+            shield=5,
+            owner_username="enemy",
+            state=CoreState.NORMAL,
+        )
+        enemy_worker = FakeActor(
+            "enemy-worker",
+            (2, 0),
+            unit_type=UnitType.WORKER,
+        )
+        turn = make_turn(
+            worker=None,
+            core=core,
+            enemies=(enemy_core, enemy_worker),
+        )
+        turn.vanguards = (guard, clearer)
+        turn.units = (guard, clearer)
+        turn.state.population = 2
+        memory = TacticMemory()
+        config = AgentConfig(spawn_unit_type=None)
+
+        plan_turn(turn, memory, config)
+        for unit in turn.units:
+            unit.actions.clear()
+        turn.tick = 11
+        plan_turn(turn, memory, config)
+
+        self.assertFalse(any(action[0] == "SWEEP" for action in clearer.actions))
+        self.assertNotIn("vanguard-b", memory.planned_stationary_targets)
+
     def test_moving_enemy_cancels_stationary_clearance(self):
         core = FakeActor("core", (10, 10))
         core.hp = 5
@@ -1870,6 +2236,257 @@ class ArenaAgentTests(unittest.TestCase):
 
         self.assertEqual(budget.status, "BUDGET_EXCEEDED")
         self.assertEqual(unreachable.status, "UNREACHABLE")
+
+    def test_tick_89304_closed_pocket_has_admitted_cargo_and_does_not_trigger(self):
+        obstacles = {
+            (-225, 667), (-223, 669), (-221, 660), (-221, 662),
+            (-221, 670), (-220, 664), (-220, 666), (-219, 659),
+            (-219, 665), (-219, 669), (-217, 670), (-216, 665),
+            (-216, 671), (-215, 659), (-215, 665), (-215, 670),
+            (-214, 672), (-213, 660), (-213, 663), (-212, 666),
+            (-212, 670), (-211, 661), (-211, 668), (-211, 669),
+            (-211, 673), (-210, 670),
+        }
+        workers = (
+            ("0f13adab", (-179, 658), 0),
+            ("626fe5a3", (-156, 661), 1),
+            ("6553c3ed", (-240, 630), 0),
+            ("656d3944", (-189, 668), 0),
+            ("8bb2ffda", (-225, 656), 0),
+            ("9a2a356b", (-228, 650), 0),
+            ("a975bdda", (-220, 541), 0),
+            ("b722cb72", (-217, 664), 1),
+            ("b865048a", (-202, 663), 0),
+            ("c3ca0560", (-217, 659), 1),
+            ("ca727ec5", (-216, 662), 0),
+            ("cee8bd78", (-224, 687), 0),
+            ("d3139ba8", (-225, 659), 1),
+            ("dd996335", (-211, 672), 0),
+            ("f0c09f3e", (-215, 664), 0),
+        )
+        turn = make_pocket_snapshot(
+            89304,
+            obstacles,
+            workers,
+            self.POCKET_GUARDS,
+        )
+        memory = TacticMemory()
+
+        pocket = _update_core_pocket(
+            turn,
+            (-217, 665),
+            obstacles,
+            _friendly_cell_occupancy(turn),
+            memory,
+            core_accepts_delivery=True,
+        )
+
+        self.assertTrue(pocket.closed)
+        self.assertEqual(len(pocket.component), 7)
+        self.assertEqual(pocket.admitted_cargo_ids, frozenset({"b722cb72"}))
+        self.assertEqual(pocket.consecutive_ticks, 0)
+        self.assertFalse(pocket.blocked)
+
+    def test_ticks_89474_89475_activate_exact_nine_cell_pocket(self):
+        turn_89474, turn_89475, obstacles_89474, obstacles_89475 = (
+            make_blocked_pocket_snapshots(self.POCKET_GUARDS)
+        )
+        memory = TacticMemory()
+        first = _update_core_pocket(
+            turn_89474,
+            (-217, 665),
+            obstacles_89474,
+            _friendly_cell_occupancy(turn_89474),
+            memory,
+            core_accepts_delivery=True,
+        )
+        second = _update_core_pocket(
+            turn_89475,
+            (-217, 665),
+            obstacles_89475,
+            _friendly_cell_occupancy(turn_89475),
+            memory,
+            core_accepts_delivery=True,
+        )
+
+        self.assertEqual(first.consecutive_ticks, 1)
+        self.assertFalse(first.blocked)
+        self.assertEqual(
+            second.component,
+            frozenset(
+                {
+                    (-219, 663), (-219, 664), (-219, 666),
+                    (-218, 663), (-218, 665), (-218, 666),
+                    (-217, 663), (-217, 664), (-217, 665),
+                }
+            ),
+        )
+        self.assertEqual(second.admitted_cargo_ids, frozenset())
+        self.assertEqual(len(second.static_reachable_cargo_ids), 7)
+        self.assertEqual(second.consecutive_ticks, 2)
+        self.assertTrue(second.blocked)
+
+    def test_real_pocket_lane_delivers_all_cargo_without_move_contention(self):
+        turn_89474, turn, obstacles_89474, _ = make_blocked_pocket_snapshots(
+            self.POCKET_GUARDS
+        )
+        memory = TacticMemory()
+        first = _update_core_pocket(
+            turn_89474,
+            (-217, 665),
+            obstacles_89474,
+            _friendly_cell_occupancy(turn_89474),
+            memory,
+            core_accepts_delivery=True,
+        )
+        self.assertEqual(first.consecutive_ticks, 1)
+
+        deposit_ticks = []
+        deposit_ids = []
+        queued_ready_at_deposit = []
+        lane_history = []
+        config = AgentConfig(spawn_unit_type=None)
+        for _ in range(96):
+            action_tick = turn.tick
+            plan_turn(turn, memory, config)
+            workers_by_id = {str(worker.id): worker for worker in turn.workers}
+            lane_history.append(
+                (
+                    action_tick,
+                    memory.cargo_lane.owner_id,
+                    memory.cargo_lane.queued_owner_id,
+                    (
+                        workers_by_id[memory.cargo_lane.owner_id].position
+                        if memory.cargo_lane.owner_id in workers_by_id
+                        else None
+                    ),
+                    tuple(sorted(memory.cargo_lane.yield_worker_ids)),
+                    {
+                        worker_id: workers_by_id[worker_id].position
+                        for worker_id in memory.cargo_lane.yield_worker_ids
+                        if worker_id in workers_by_id
+                    },
+                    dict(memory.cargo_lane.stage_targets),
+                    dict(memory.route_diagnostics),
+                )
+            )
+            if action_tick == 89475:
+                self.assertTrue(memory.cargo_lane.active)
+                self.assertEqual(memory.cargo_lane.owner_id, "cee8bd78")
+                self.assertEqual(
+                    memory.cargo_lane.path,
+                    (
+                        (-217, 665),
+                        (-217, 664),
+                        (-216, 664),
+                        (-215, 664),
+                    ),
+                )
+                self.assertEqual(
+                    memory.cargo_lane.gateway,
+                    memory.cargo_lane.path[-1],
+                )
+                self.assertEqual(
+                    memory.cargo_lane.yield_worker_ids,
+                    {"656d3944", "b722cb72"},
+                )
+                blocker = workers_by_id["656d3944"]
+                self.assertEqual(blocker.actions[0][0], "MOVE")
+            _, deposited = apply_synchronous_actions(turn)
+            if deposited:
+                deposit_ticks.extend([action_tick] * len(deposited))
+                deposit_ids.extend(deposited)
+                queued_id = memory.cargo_lane.queued_owner_id
+                workers_after_actions = {
+                    str(worker.id): worker for worker in turn.workers
+                }
+                queued_ready_at_deposit.extend(
+                    [
+                        bool(
+                            queued_id in workers_after_actions
+                            and workers_after_actions[queued_id].position
+                            == memory.cargo_lane.gateway
+                        )
+                    ]
+                    * len(deposited)
+                )
+            if len(deposit_ids) == 7:
+                break
+
+        remaining = {
+            str(worker.id): worker.position
+            for worker in turn.workers
+            if worker.cargo > 0
+        }
+        self.assertEqual(
+            len(set(deposit_ids)),
+            7,
+            f"deposit_ids={deposit_ids}, deposit_ticks={deposit_ticks}, "
+            f"remaining={remaining}, lane={memory.cargo_lane}, "
+            f"history={lane_history}",
+        )
+        self.assertLessEqual(
+            deposit_ticks[0],
+            89483,
+            f"deposit_ticks={deposit_ticks}, history={lane_history[:20]}",
+        )
+        intervals = [
+            current - previous
+            for previous, current in zip(deposit_ticks, deposit_ticks[1:])
+        ]
+        steady_intervals = [
+            interval
+            for interval, queued_ready in zip(
+                intervals,
+                queued_ready_at_deposit,
+            )
+            if queued_ready
+        ]
+        self.assertGreaterEqual(
+            len(steady_intervals),
+            4,
+            f"deposit_ticks={deposit_ticks}, queued={queued_ready_at_deposit}",
+        )
+        self.assertTrue(
+            all(interval <= 4 for interval in steady_intervals),
+            f"deposit_ticks={deposit_ticks}, intervals={intervals}, "
+            f"queued={queued_ready_at_deposit}, "
+            f"history={lane_history}",
+        )
+
+    def test_stalled_admitted_cargo_stops_suppressing_pocket(self):
+        cargo = FakeActor("cargo", (0, -1), cargo=1)
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        obstacles = {(1, 0), (0, 1), (-1, 0)}
+        turn = make_turn(
+            worker=cargo,
+            core=core,
+            obstacles=frozenset(obstacles),
+        )
+        memory = TacticMemory()
+
+        observations = []
+        for tick in range(10, 14):
+            turn.tick = tick
+            observations.append(
+                _update_core_pocket(
+                    turn,
+                    (0, 0),
+                    obstacles,
+                    _friendly_cell_occupancy(turn),
+                    memory,
+                    core_accepts_delivery=True,
+                )
+            )
+
+        self.assertEqual(observations[1].admitted_cargo_ids, frozenset({"cargo"}))
+        self.assertEqual(
+            observations[2].stalled_admitted_cargo_ids,
+            frozenset({"cargo"}),
+        )
+        self.assertEqual(observations[2].consecutive_ticks, 1)
+        self.assertTrue(observations[3].blocked)
 
     def test_worker_route_cache_reuses_valid_remaining_path(self):
         memory = TacticMemory()
@@ -1947,6 +2564,236 @@ class ArenaAgentTests(unittest.TestCase):
 
         self.assertEqual(memory.contested_worker_positions("worker", turn.tick), set())
         self.assertEqual(worker.actions, [("MOVE", Direction.RIGHT)])
+
+    def test_queue_move_keeps_enemy_target_as_a_hard_blocker(self):
+        vanguard = FakeActor("vanguard", (0, 0), unit_type=UnitType.VANGUARD)
+        moved = _queue_move(
+            vanguard,
+            (1, 0),
+            {(1, 0), (-1, 0), (0, -1), (0, 1)},
+            {},
+            friendly_occupancy={(0, 0): 1},
+        )
+
+        self.assertFalse(moved)
+        self.assertEqual(vanguard.actions, [])
+
+    def test_historical_stationary_scene_never_moves_into_enemy_occupied_cell(self):
+        vanguard = FakeActor(
+            "vanguard",
+            (-213, 633),
+            unit_type=UnitType.VANGUARD,
+        )
+        enemy_positions = {
+            (-213, 634),
+            (-212, 633),
+            (-212, 634),
+        }
+
+        moved = _queue_move(
+            vanguard,
+            (-212, 634),
+            enemy_positions,
+            {},
+            friendly_occupancy={(-213, 633): 1},
+        )
+
+        if moved:
+            destination = _next_position(vanguard.position, vanguard.actions[0][1])
+            self.assertNotIn(destination, enemy_positions)
+        else:
+            self.assertEqual(vanguard.actions, [])
+
+    def test_combat_move_failure_avoids_destination_and_cools_stationary_target(self):
+        vanguard = FakeActor("vanguard", (0, 0), unit_type=UnitType.VANGUARD)
+        memory = TacticMemory()
+        self.assertTrue(
+            _queue_move(
+                vanguard,
+                (1, 0),
+                set(),
+                {},
+                friendly_occupancy={(0, 0): 1},
+                memory=memory,
+                tick=10,
+                stationary_target=(2, 0),
+            )
+        )
+        turn = make_turn(worker=None)
+        turn.tick = 11
+        turn.units = (vanguard,)
+        turn.vanguards = (vanguard,)
+        turn.events = (
+            SimpleNamespace(
+                event_type="UNIT_MOVE_FAILED",
+                reason_code="MOVE_DESTINATION_OCCUPIED",
+                actor_id="vanguard",
+                target_id="enemy-worker",
+                position=None,
+            ),
+        )
+
+        memory.observe(turn)
+
+        self.assertEqual(
+            memory.contested_unit_positions("vanguard", turn.tick),
+            {(1, 0)},
+        )
+        self.assertEqual(
+            memory.stationary_clear_cooldowns[(2, 0)],
+            turn.tick + MOVE_OCCUPIED_AVOID_TICKS,
+        )
+        vanguard.actions.clear()
+        self.assertTrue(
+            _queue_move(
+                vanguard,
+                (1, 1),
+                set(),
+                {},
+                friendly_occupancy={(0, 0): 1},
+                memory=memory,
+                tick=turn.tick,
+            )
+        )
+        self.assertNotEqual(vanguard.actions, [("MOVE", Direction.RIGHT)])
+
+    def test_cell_unit_limit_avoids_worker_destination_for_eight_ticks(self):
+        worker = FakeActor("worker", (0, 0), cargo=1)
+        core = FakeActor("core", (3, 0))
+        core.hp = 5
+        turn = make_turn(worker=worker, core=core)
+        memory = TacticMemory()
+        config = AgentConfig(spawn_unit_type=None)
+
+        plan_turn(turn, memory, config)
+        self.assertEqual(memory.planned_worker_destinations["worker"], (1, 0))
+
+        worker.actions.clear()
+        turn.tick = 11
+        turn.events = (
+            SimpleNamespace(
+                event_type="UNIT_MOVE_FAILED",
+                reason_code="CELL_UNIT_LIMIT",
+                actor_id="worker",
+                target_id=None,
+                position=None,
+            ),
+        )
+        plan_turn(turn, memory, config)
+
+        self.assertEqual(
+            memory.contested_worker_positions("worker", turn.tick),
+            {(1, 0)},
+        )
+        self.assertNotEqual(worker.actions, [("MOVE", Direction.RIGHT)])
+
+        worker.actions.clear()
+        turn.tick += MOVE_OCCUPIED_AVOID_TICKS
+        turn.events = ()
+        memory.worker_routes.clear()
+        plan_turn(turn, memory, config)
+
+        self.assertEqual(memory.contested_worker_positions("worker", turn.tick), set())
+        self.assertEqual(worker.actions, [("MOVE", Direction.RIGHT)])
+
+    def test_cell_unit_limit_cools_combat_stationary_target(self):
+        vanguard = FakeActor("vanguard", (0, 0), unit_type=UnitType.VANGUARD)
+        memory = TacticMemory()
+        self.assertTrue(
+            _queue_move(
+                vanguard,
+                (1, 0),
+                set(),
+                {},
+                friendly_occupancy={(0, 0): 1},
+                memory=memory,
+                tick=10,
+                stationary_target=(2, 0),
+            )
+        )
+        turn = make_turn(worker=None)
+        turn.tick = 11
+        turn.units = (vanguard,)
+        turn.vanguards = (vanguard,)
+        turn.events = (
+            SimpleNamespace(
+                event_type="UNIT_MOVE_FAILED",
+                reason_code="CELL_UNIT_LIMIT",
+                actor_id="vanguard",
+                target_id="enemy-worker",
+                position=None,
+            ),
+        )
+
+        memory.observe(turn)
+
+        self.assertEqual(
+            memory.contested_unit_positions("vanguard", turn.tick),
+            {(1, 0)},
+        )
+        self.assertEqual(
+            memory.stationary_clear_cooldowns[(2, 0)],
+            turn.tick + MOVE_OCCUPIED_AVOID_TICKS,
+        )
+
+    def test_two_contested_stationary_moves_apply_global_target_cooldown(self):
+        vanguard = FakeActor("vanguard-a", (0, 0), unit_type=UnitType.VANGUARD)
+        other = FakeActor("vanguard-b", (5, 0), unit_type=UnitType.VANGUARD)
+        memory = TacticMemory()
+        event = SimpleNamespace(
+            event_type="UNIT_MOVE_FAILED",
+            reason_code="MOVE_CONTESTED",
+            actor_id="vanguard-a",
+            target_id="enemy-worker",
+            position=None,
+        )
+        turn = make_turn(worker=None)
+        turn.units = (vanguard, other)
+        turn.vanguards = (vanguard, other)
+        turn.events = (event,)
+
+        memory.note_unit_move(
+            "vanguard-a",
+            (1, 0),
+            (1, 0),
+            stationary_target=(2, 0),
+        )
+        turn.tick = 11
+        memory.observe(turn)
+        self.assertNotIn((2, 0), memory.stationary_clear_cooldowns)
+
+        memory.note_unit_move(
+            "vanguard-a",
+            (1, 0),
+            (1, 0),
+            stationary_target=(2, 0),
+        )
+        turn.tick = 15
+        memory.observe(turn)
+
+        self.assertEqual(
+            memory.stationary_clear_cooldowns[(2, 0)],
+            turn.tick + MOVE_OCCUPIED_AVOID_TICKS,
+        )
+        self.assertNotIn("vanguard-a", memory.stationary_move_failures)
+
+        enemy = FakeActor("enemy-worker", (2, 0), unit_type=UnitType.WORKER)
+        enemy.hp = 1
+        core = FakeActor("core", (10, 10))
+        core.hp = 5
+        turn.core = core
+        turn.visible_enemies = (enemy,)
+        turn.events = ()
+        turn.tick = 16
+        memory.stationary_enemy_observation_memory["enemy-worker"] = (
+            15,
+            (2, 0),
+            2,
+            "UNIT",
+        )
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertNotIn("vanguard-b", memory.planned_stationary_targets)
 
     def test_visible_enemy_core_and_worker_cells_block_cargo_return(self):
         for enemy in (
@@ -2397,6 +3244,26 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertNotIn((0, 1), assignments.values())
         self.assertEqual(idle_count, 1)
 
+    def test_guard_cannot_idle_on_a_reserved_core_neighbor(self):
+        guard = FakeActor("ranger", (0, -1), unit_type=UnitType.RANGER)
+        reserved = {(0, -1)}
+
+        assignments, _, idle_count = _assign_guard_posts(
+            (guard,),
+            (0, 0),
+            (1, 2),
+            set(),
+            set(),
+            set(),
+            set(),
+            reserved,
+            {(0, -1): 1},
+        )
+
+        self.assertNotEqual(assignments["ranger"], (0, -1))
+        self.assertNotIn(assignments["ranger"], reserved)
+        self.assertEqual(idle_count, 0)
+
     def test_raid_assignment_pads_three_rows_for_two_real_positions(self):
         units = [
             FakeActor(f"vanguard-{index}", (0, index + 1), unit_type=UnitType.VANGUARD)
@@ -2709,7 +3576,7 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertEqual(memory.raid.state, "CORE_RECALL")
         self.assertFalse(any(action[0] == "SWEEP" for action in vanguard.actions))
 
-    def test_one_hp_raid_ranger_attacks_once_then_recalls(self):
+    def test_one_hp_raid_ranger_recalls_immediately_without_attacking(self):
         core = FakeActor("core", (0, 0))
         core.hp = 5
         ranger = FakeActor("ranger", (8, 0), unit_type=UnitType.RANGER)
@@ -2745,14 +3612,9 @@ class ArenaAgentTests(unittest.TestCase):
         )
 
         plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
-        self.assertEqual(ranger.actions, [("SHOOT", "enemy-core")])
-        self.assertEqual(memory.raid.state, "CORE_RAID")
-
-        ranger.actions.clear()
-        turn.tick = 21
-        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
         self.assertEqual(memory.raid.state, "CORE_RECALL")
         self.assertFalse(any(action[0] == "SHOOT" for action in ranger.actions))
+        self.assertEqual(ranger.actions, [("MOVE", Direction.LEFT)])
 
     def test_core_raid_recalls_after_six_ticks_without_progress(self):
         core = FakeActor("core", (0, 0))
@@ -2790,6 +3652,123 @@ class ArenaAgentTests(unittest.TestCase):
         for tick in range(20, 26):
             turn.tick = tick
             ranger.actions.clear()
+            plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(memory.raid.state, "CORE_RECALL")
+
+    def test_core_staging_replans_an_occupied_assignment(self):
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        blocker = FakeActor("blocker", (9, 0))
+        vanguards = tuple(
+            FakeActor(f"vanguard-{index}", (-index - 1, 0), UnitType.VANGUARD)
+            for index in range(3)
+        )
+        for unit in vanguards:
+            unit.hp = 4
+        rangers = tuple(
+            FakeActor(f"ranger-{index}", (-index - 1, 1), UnitType.RANGER)
+            for index in range(3)
+        )
+        enemy_core = SimpleNamespace(
+            id="enemy-core",
+            position=(10, 0),
+            hp=5,
+            shield=5,
+            owner_username="enemy",
+            state=CoreState.NORMAL,
+        )
+        turn = make_turn(worker=blocker, core=core, enemies=(enemy_core,))
+        turn.tick = 20
+        turn.vanguards = vanguards
+        turn.rangers = rangers
+        turn.units = (blocker,) + vanguards + rangers
+        turn.state.population = len(turn.units)
+        turn.resources = 22
+        member_ids = {"vanguard-1", "vanguard-2", "ranger-1", "ranger-2"}
+        memory = TacticMemory(
+            enemy_core_memory={
+                "enemy-core": EnemyCoreObservation(
+                    "enemy-core", (10, 0), 5, 5, "NORMAL", 20
+                )
+            },
+            raid=CoreRaidPlan(
+                state="CORE_STAGING",
+                target_id="enemy-core",
+                target_position=(10, 0),
+                raid_member_ids=set(member_ids),
+                assignments={
+                    "vanguard-1": (9, 0),
+                    "vanguard-2": (10, 1),
+                    "ranger-1": (8, 0),
+                    "ranger-2": (10, 2),
+                },
+            ),
+        )
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(memory.raid.state, "CORE_STAGING")
+        self.assertEqual(memory.raid.last_replan_tick, 20)
+        self.assertEqual(memory.raid.last_replan_reason, "FRIENDLY_OCCUPIED")
+        self.assertNotIn((9, 0), memory.raid.assignments.values())
+
+    def test_core_staging_recalls_after_six_unchanged_route_ticks(self):
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        vanguards = tuple(
+            FakeActor(f"vanguard-{index}", (-index - 1, 0), UnitType.VANGUARD)
+            for index in range(3)
+        )
+        for unit in vanguards:
+            unit.hp = 4
+        rangers = tuple(
+            FakeActor(f"ranger-{index}", (-index - 1, 1), UnitType.RANGER)
+            for index in range(3)
+        )
+        enemy_core = SimpleNamespace(
+            id="enemy-core",
+            position=(10, 0),
+            hp=5,
+            shield=5,
+            owner_username="enemy",
+            state=CoreState.NORMAL,
+        )
+        turn = make_turn(worker=None, core=core, enemies=(enemy_core,))
+        turn.vanguards = vanguards
+        turn.rangers = rangers
+        turn.units = vanguards + rangers
+        turn.state.population = len(turn.units)
+        turn.resources = 22
+        memory = TacticMemory(
+            enemy_core_memory={
+                "enemy-core": EnemyCoreObservation(
+                    "enemy-core", (10, 0), 5, 5, "NORMAL", 20
+                )
+            },
+            raid=CoreRaidPlan(
+                state="CORE_STAGING",
+                target_id="enemy-core",
+                target_position=(10, 0),
+                raid_member_ids={
+                    "vanguard-1",
+                    "vanguard-2",
+                    "ranger-1",
+                    "ranger-2",
+                },
+                assignments={
+                    "vanguard-1": (9, 0),
+                    "vanguard-2": (10, 1),
+                    "ranger-1": (8, 0),
+                    "ranger-2": (10, 2),
+                },
+            ),
+        )
+
+        for tick in range(20, 27):
+            turn.tick = tick
+            for unit in turn.units:
+                unit.actions.clear()
             plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
 
         self.assertEqual(memory.raid.state, "CORE_RECALL")

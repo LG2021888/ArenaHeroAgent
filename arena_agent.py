@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+from collections import deque
 from datetime import datetime, timezone
 import heapq
 import json
@@ -135,6 +136,15 @@ EARLY_DEFENSE_VANGUARD_TARGET = 1
 EARLY_DEFENSE_RANGER_TARGET = 1
 RECENT_ATTACK_MEMORY_TICKS = 6
 MOVE_CONTESTED_AVOID_TICKS = 3
+MOVE_OCCUPIED_AVOID_TICKS = 8
+STATIONARY_CLEAR_CONTESTED_FAILURES = 2
+CORE_POCKET_MAX_CELLS = 128
+CORE_POCKET_DEBOUNCE_TICKS = 2
+POPULATION_EXPANSION_RESOURCE_FLOOR = 150
+POPULATION_EXPANSION_CASUALTY_BUFFER_UNITS = 6
+ADMITTED_CARGO_STALL_TICKS = 3
+CARGO_LANE_RADIUS = 8
+CARGO_LANE_STAGE_RADII = (3, 4, 5)
 
 
 class _Ansi:
@@ -310,9 +320,7 @@ BASELINE_RANGER_TARGET = 4
 DEFAULT_WORKER_TARGET = 16
 DEFAULT_VANGUARD_TARGET = 6
 DEFAULT_RANGER_TARGET = 8
-DEFAULT_MAX_POPULATION = (
-    DEFAULT_WORKER_TARGET + DEFAULT_VANGUARD_TARGET + DEFAULT_RANGER_TARGET
-)
+DEFAULT_MAX_POPULATION = 0
 
 UNIT_LABELS = {
     UnitType.WORKER: "\u5de5\u4eba",
@@ -328,6 +336,9 @@ class AgentConfig:
     max_population: int = DEFAULT_MAX_POPULATION
     spawn_unit_type: UnitType | None = UnitType.WORKER
     auto_production: bool = True
+    population_expansion_enabled: bool = False
+    expansion_resource_threshold: int = POPULATION_EXPANSION_RESOURCE_FLOOR
+    expansion_casualty_buffer_units: int = POPULATION_EXPANSION_CASUALTY_BUFFER_UNITS
     worker_target: int = DEFAULT_WORKER_TARGET
     vanguard_target: int = DEFAULT_VANGUARD_TARGET
     ranger_target: int = DEFAULT_RANGER_TARGET
@@ -428,6 +439,55 @@ class CargoRecovery:
 
 
 @dataclass
+class StationaryMoveFailure:
+    destination: Position
+    target: Position
+    consecutive_failures: int
+    last_tick: int
+
+
+@dataclass
+class AdmittedCargoProgress:
+    position: Position
+    stationary_ticks: int
+    last_tick: int
+
+
+@dataclass(frozen=True)
+class CorePocketObservation:
+    component: frozenset[Position] = frozenset()
+    closed: bool = False
+    raw_admitted_cargo_ids: frozenset[str] = frozenset()
+    admitted_cargo_ids: frozenset[str] = frozenset()
+    stalled_admitted_cargo_ids: frozenset[str] = frozenset()
+    outside_cargo_ids: frozenset[str] = frozenset()
+    static_reachable_cargo_ids: frozenset[str] = frozenset()
+    consecutive_ticks: int = 0
+    blocked: bool = False
+
+
+@dataclass(frozen=True)
+class CargoLaneBridge:
+    path: tuple[Position, ...]
+    gateway: Position
+    blocker_ids: frozenset[str]
+
+
+@dataclass
+class CargoLanePlan:
+    active: bool = False
+    core_position: Position | None = None
+    owner_id: str | None = None
+    queued_owner_id: str | None = None
+    path: tuple[Position, ...] = ()
+    gateway: Position | None = None
+    yield_worker_ids: set[str] = field(default_factory=set)
+    stage_targets: dict[str, Position] = field(default_factory=dict)
+    started_tick: int = 0
+    last_planned_tick: int = -1
+
+
+@dataclass
 class CoreRaidPlan:
     state: str = "IDLE"
     target_id: str | None = None
@@ -442,6 +502,8 @@ class CoreRaidPlan:
     last_durability: int | None = None
     last_formation_cost: int | None = None
     stalled_ticks: int = 0
+    last_replan_tick: int = -1
+    last_replan_reason: str | None = None
     ranger_retreat_after_tick: dict[str, int] = field(default_factory=dict)
 
 
@@ -486,8 +548,28 @@ class TacticMemory:
     worker_contested_positions: dict[str, dict[Position, int]] = field(
         default_factory=dict
     )
+    unit_contested_positions: dict[str, dict[Position, int]] = field(
+        default_factory=dict
+    )
+    planned_unit_destinations: dict[str, Position] = field(default_factory=dict)
+    planned_unit_targets: dict[str, Position] = field(default_factory=dict)
+    planned_stationary_targets: dict[str, Position] = field(default_factory=dict)
+    stationary_clear_cooldowns: dict[Position, int] = field(default_factory=dict)
+    stationary_move_failures: dict[str, StationaryMoveFailure] = field(
+        default_factory=dict
+    )
     cargo_recovery: dict[str, CargoRecovery] = field(default_factory=dict)
     route_diagnostics: dict[str, str] = field(default_factory=dict)
+    admitted_cargo_progress: dict[str, AdmittedCargoProgress] = field(
+        default_factory=dict
+    )
+    core_pocket: CorePocketObservation = field(default_factory=CorePocketObservation)
+    core_pocket_candidate_tick: int = -1
+    core_pocket_candidate_core: Position | None = None
+    core_pocket_candidate_cargo_ids: set[str] = field(default_factory=set)
+    core_pocket_candidate_streak: int = 0
+    cargo_lane: CargoLanePlan = field(default_factory=CargoLanePlan)
+    cargo_lane_wait_ticks: dict[str, int] = field(default_factory=dict)
     core_lane_departing_worker_id: str | None = None
     core_lane_yield_worker_ids: set[str] = field(default_factory=set)
     core_observer_return_ids: set[str] = field(default_factory=set)
@@ -501,10 +583,20 @@ class TacticMemory:
         self.obstacle_memory.update(_positions(getattr(turn, "obstacle_cells", ())))
         tick = int(getattr(turn, "tick", 0))
         previous_worker_destinations = self.planned_worker_destinations
+        previous_unit_destinations = self.planned_unit_destinations
+        previous_stationary_targets = self.planned_stationary_targets
         self.planned_worker_destinations = {}
+        self.planned_unit_destinations = {}
+        self.planned_unit_targets = {}
+        self.planned_stationary_targets = {}
         self.last_observed_tick = tick
         self.route_diagnostics.clear()
         self.guard_idle_assignments = 0
+        living_unit_ids = {
+            str(getattr(unit, "id", ""))
+            for unit in getattr(turn, "units", ())
+            if getattr(unit, "id", None) is not None
+        }
         living_worker_ids: set[str] = set()
         for worker in getattr(turn, "workers", ()):
             worker_key = str(getattr(worker, "id", ""))
@@ -521,7 +613,11 @@ class TacticMemory:
             self.worker_routes.pop(worker_key, None)
             self.worker_contested_positions.pop(worker_key, None)
             self.cargo_recovery.pop(worker_key, None)
+            self.admitted_cargo_progress.pop(worker_key, None)
             self.core_observer_return_ids.discard(worker_key)
+        for unit_key in set(self.unit_contested_positions) - living_unit_ids:
+            self.unit_contested_positions.pop(unit_key, None)
+            self.stationary_move_failures.pop(unit_key, None)
         if self.core_lane_departing_worker_id not in living_worker_ids:
             self.core_lane_departing_worker_id = None
             self.core_lane_yield_worker_ids.clear()
@@ -570,22 +666,85 @@ class TacticMemory:
             )
             if event_type == "CORE_LOST" or own_core_destroyed:
                 self.recovery_until_tick = max(self.recovery_until_tick, tick + 8)
+            if event_type == "UNIT_MOVE_SUCCEEDED" and actor_id:
+                self.stationary_move_failures.pop(actor_id, None)
             if event_type == "UNIT_MOVE_FAILED" and actor_id:
                 self.worker_routes.pop(actor_id, None)
                 self.route_diagnostics[actor_id] = reason_code or "MOVE_FAILED"
-                if reason_code == "MOVE_CONTESTED" and actor_id in living_worker_ids:
-                    contested_position = previous_worker_destinations.get(actor_id)
-                    if contested_position is None:
-                        contested_position = _position(getattr(event, "position", None))
-                    if contested_position is not None:
-                        contested = self.worker_contested_positions.setdefault(
+                occupied_failure = reason_code in {
+                    "MOVE_DESTINATION_OCCUPIED",
+                    "CELL_UNIT_LIMIT",
+                }
+                avoid_ticks = (
+                    MOVE_CONTESTED_AVOID_TICKS
+                    if reason_code == "MOVE_CONTESTED"
+                    else MOVE_OCCUPIED_AVOID_TICKS
+                    if occupied_failure
+                    else 0
+                )
+                failed_destination = previous_unit_destinations.get(actor_id)
+                if failed_destination is None:
+                    failed_destination = previous_worker_destinations.get(actor_id)
+                if failed_destination is None:
+                    failed_destination = _position(getattr(event, "position", None))
+                if (
+                    avoid_ticks > 0
+                    and actor_id in living_unit_ids
+                    and failed_destination is not None
+                ):
+                    contested = self.unit_contested_positions.setdefault(actor_id, {})
+                    contested[failed_destination] = max(
+                        contested.get(failed_destination, 0),
+                        tick + avoid_ticks,
+                    )
+                    if actor_id in living_worker_ids:
+                        worker_contested = self.worker_contested_positions.setdefault(
                             actor_id,
                             {},
                         )
-                        contested[contested_position] = max(
-                            contested.get(contested_position, 0),
-                            tick + MOVE_CONTESTED_AVOID_TICKS,
+                        worker_contested[failed_destination] = max(
+                            worker_contested.get(failed_destination, 0),
+                            tick + avoid_ticks,
                         )
+                    elif occupied_failure:
+                        failed_target = previous_stationary_targets.get(actor_id)
+                        if failed_target is not None:
+                            self.stationary_clear_cooldowns[failed_target] = max(
+                                self.stationary_clear_cooldowns.get(failed_target, 0),
+                                tick + MOVE_OCCUPIED_AVOID_TICKS,
+                            )
+                            self.stationary_move_failures.pop(actor_id, None)
+                    elif reason_code == "MOVE_CONTESTED":
+                        failed_target = previous_stationary_targets.get(actor_id)
+                        if failed_target is not None:
+                            previous_failure = self.stationary_move_failures.get(actor_id)
+                            consecutive_failures = (
+                                previous_failure.consecutive_failures + 1
+                                if previous_failure is not None
+                                and previous_failure.destination == failed_destination
+                                and previous_failure.target == failed_target
+                                and 0 < tick - previous_failure.last_tick
+                                <= MOVE_OCCUPIED_AVOID_TICKS
+                                else 1
+                            )
+                            if (
+                                consecutive_failures
+                                >= STATIONARY_CLEAR_CONTESTED_FAILURES
+                            ):
+                                self.stationary_clear_cooldowns[failed_target] = max(
+                                    self.stationary_clear_cooldowns.get(failed_target, 0),
+                                    tick + MOVE_OCCUPIED_AVOID_TICKS,
+                                )
+                                self.stationary_move_failures.pop(actor_id, None)
+                            else:
+                                self.stationary_move_failures[actor_id] = (
+                                    StationaryMoveFailure(
+                                        destination=failed_destination,
+                                        target=failed_target,
+                                        consecutive_failures=consecutive_failures,
+                                        last_tick=tick,
+                                    )
+                                )
             if event_type in {
                 "CORE_DESTROYED",
                 "CORE_LOST",
@@ -807,6 +966,21 @@ class TacticMemory:
                     positions.pop(position, None)
             if not positions:
                 self.worker_contested_positions.pop(worker_key, None)
+        for unit_key, positions in tuple(self.unit_contested_positions.items()):
+            for position, expires_at in tuple(positions.items()):
+                if expires_at <= tick:
+                    positions.pop(position, None)
+            if not positions:
+                self.unit_contested_positions.pop(unit_key, None)
+        for position, expires_at in tuple(self.stationary_clear_cooldowns.items()):
+            if expires_at <= tick:
+                self.stationary_clear_cooldowns.pop(position, None)
+        for unit_key, failure in tuple(self.stationary_move_failures.items()):
+            if (
+                unit_key not in living_unit_ids
+                or tick - failure.last_tick > MOVE_OCCUPIED_AVOID_TICKS
+            ):
+                self.stationary_move_failures.pop(unit_key, None)
         for enemy_key, observation in tuple(
             self.stationary_enemy_observation_memory.items()
         ):
@@ -871,7 +1045,7 @@ class TacticMemory:
         return danger
 
     def contested_worker_positions(self, actor_id: Any, tick: int) -> set[Position]:
-        return {
+        positions = {
             position
             for position, expires_at in self.worker_contested_positions.get(
                 str(actor_id),
@@ -879,9 +1053,36 @@ class TacticMemory:
             ).items()
             if expires_at > tick
         }
+        positions.update(self.contested_unit_positions(actor_id, tick))
+        return positions
+
+    def contested_unit_positions(self, actor_id: Any, tick: int) -> set[Position]:
+        return {
+            position
+            for position, expires_at in self.unit_contested_positions.get(
+                str(actor_id),
+                {},
+            ).items()
+            if expires_at > tick
+        }
 
     def note_worker_move(self, actor_id: Any, destination: Position) -> None:
-        self.planned_worker_destinations[str(actor_id)] = destination
+        actor_key = str(actor_id)
+        self.planned_worker_destinations[actor_key] = destination
+        self.planned_unit_destinations[actor_key] = destination
+
+    def note_unit_move(
+        self,
+        actor_id: Any,
+        destination: Position,
+        target: Position,
+        stationary_target: Position | None = None,
+    ) -> None:
+        actor_key = str(actor_id)
+        self.planned_unit_destinations[actor_key] = destination
+        self.planned_unit_targets[actor_key] = target
+        if stationary_target is not None:
+            self.planned_stationary_targets[actor_key] = stationary_target
 
     def clear_resource_intent(self, actor_id: Any) -> None:
         key = str(actor_id)
@@ -1628,6 +1829,36 @@ class SessionRecorder:
         }
         if memory.route_diagnostics:
             payload["route_anomalies"] = dict(sorted(memory.route_diagnostics.items()))
+        pocket = memory.core_pocket
+        if pocket.closed or pocket.consecutive_ticks:
+            payload["core_pocket"] = {
+                "status": "BLOCKED" if pocket.blocked else "CLOSED",
+                "size": len(pocket.component),
+                "admitted_cargo_ids": sorted(pocket.admitted_cargo_ids),
+                "stalled_admitted_cargo_ids": sorted(
+                    pocket.stalled_admitted_cargo_ids
+                ),
+                "outside_cargo_ids": sorted(pocket.outside_cargo_ids),
+                "static_reachable_cargo_ids": sorted(
+                    pocket.static_reachable_cargo_ids
+                ),
+                "consecutive_ticks": pocket.consecutive_ticks,
+            }
+        lane = memory.cargo_lane
+        if lane.active:
+            payload["cargo_lane"] = {
+                "owner_id": lane.owner_id,
+                "queued_owner_id": lane.queued_owner_id,
+                "path": [_json_position(position) for position in lane.path],
+                "gateway": _json_position(lane.gateway),
+                "yield_worker_ids": sorted(lane.yield_worker_ids),
+                "stage_targets": {
+                    worker_id: _json_position(target)
+                    for worker_id, target in sorted(lane.stage_targets.items())
+                },
+                "started_tick": lane.started_tick,
+                "last_planned_tick": lane.last_planned_tick,
+            }
         active_contested = {
             worker_id: [
                 _json_position(position)
@@ -1652,6 +1883,13 @@ class SessionRecorder:
                 "target_position": _json_position(memory.raid.target_position),
                 "observer_id": memory.raid.observer_id,
                 "member_count": len(memory.raid.raid_member_ids),
+            }
+        if memory.raid.last_replan_tick == report.tick:
+            payload["core_raid_replan"] = {
+                "reason": memory.raid.last_replan_reason,
+                "member_count": len(memory.raid.raid_member_ids),
+                "formation_cost": memory.raid.last_formation_cost,
+                "stalled_ticks": memory.raid.stalled_ticks,
             }
         self.trace_logger.info(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -2161,6 +2399,7 @@ def _assign_guard_posts(
             and origin not in danger_cells
             and origin not in resource_cells
             and origin not in enemy_positions
+            and origin not in reserved_positions
             and friendly_occupancy.get(origin, 0) <= 1
         )
         if origin_is_legal:
@@ -2573,8 +2812,38 @@ def _threat_level(core: Any, enemies: list[Any]) -> str:
     return "NORMAL"
 
 
-def _choose_spawn_unit(turn: Any, config: AgentConfig) -> UnitType | None:
-    """Restore the baseline roster before filling configured expansion targets."""
+def _population_expansion_threshold(turn: Any, config: AgentConfig) -> int:
+    casualty_buffer = max(0, config.expansion_casualty_buffer_units) * 5
+    return max(
+        0,
+        config.expansion_resource_threshold,
+        _resource_capacity(turn) - casualty_buffer,
+    )
+
+
+def _proportional_expansion_unit(counts: dict[UnitType, int]) -> UnitType:
+    weights = {
+        UnitType.WORKER: 8,
+        UnitType.VANGUARD: 3,
+        UnitType.RANGER: 4,
+    }
+    population = sum(counts.values())
+    weight_total = sum(weights.values())
+    return min(
+        (UnitType.WORKER, UnitType.VANGUARD, UnitType.RANGER),
+        key=lambda unit_type: (
+            counts[unit_type] * weight_total - population * weights[unit_type],
+            (UnitType.WORKER, UnitType.VANGUARD, UnitType.RANGER).index(unit_type),
+        ),
+    )
+
+
+def _choose_spawn_unit(
+    turn: Any,
+    config: AgentConfig,
+    pending_delivery: int = 0,
+) -> UnitType | None:
+    """Restore configured targets, then optionally grow at a resource floor."""
 
     if config.spawn_unit_type is None:
         return None
@@ -2584,6 +2853,9 @@ def _choose_spawn_unit(turn: Any, config: AgentConfig) -> UnitType | None:
         UnitType.VANGUARD: len(tuple(getattr(turn, "vanguards", ()))),
         UnitType.RANGER: len(tuple(getattr(turn, "rangers", ()))),
     }
+    population = _population(turn)
+    if config.max_population > 0 and population >= config.max_population:
+        return None
     if config.auto_production:
         final_targets = {
             unit_type: max(0, config.target_for(unit_type))
@@ -2623,6 +2895,12 @@ def _choose_spawn_unit(turn: Any, config: AgentConfig) -> UnitType | None:
         for unit_type in (UnitType.WORKER, UnitType.VANGUARD, UnitType.RANGER):
             if counts[unit_type] < final_targets[unit_type]:
                 return unit_type
+        if (
+            config.population_expansion_enabled
+            and _available_resources(turn, pending_delivery)
+            >= _population_expansion_threshold(turn, config)
+        ):
+            return _proportional_expansion_unit(counts)
         return None
 
     if counts[config.spawn_unit_type] < max(0, config.target_for(config.spawn_unit_type)):
@@ -2763,18 +3041,33 @@ def _queue_move(
     *,
     discouraged: set[Position] | None = None,
     friendly_occupancy: dict[Position, int] | None = None,
+    memory: TacticMemory | None = None,
+    tick: int = 0,
+    stationary_target: Position | None = None,
 ) -> bool:
     origin = _position(getattr(actor, "position", None))
     if origin is None or target is None or origin == target:
         return False
-    movement_blocked = set(blocked)
+    hard_blocked = set(blocked)
+    movement_blocked = set(hard_blocked)
     capacity_blocked = _unit_capacity_blocked(
         friendly_occupancy or {},
         reserved_destinations,
         actor_origin=origin,
     )
     movement_blocked.update(capacity_blocked)
-    movement_blocked.discard(target)
+    contested_blocked: set[Position] = set()
+    if memory is not None:
+        contested_blocked = memory.contested_unit_positions(
+            getattr(actor, "id", ""),
+            tick,
+        )
+        movement_blocked.update(contested_blocked)
+    # A friendly Unit can temporarily occupy an approach target, but obstacles,
+    # danger cells, enemy occupants, and recently rejected destinations remain
+    # hard blockers.
+    if target not in hard_blocked and target not in contested_blocked:
+        movement_blocked.discard(target)
     soft_discouraged = set(discouraged or ())
     direction = choose_step_direction(
         origin,
@@ -2789,6 +3082,13 @@ def _queue_move(
         return False
     if reserved_destinations is not None:
         _reserve_destination(reserved_destinations, destination)
+    if memory is not None:
+        memory.note_unit_move(
+            getattr(actor, "id", ""),
+            destination,
+            target,
+            stationary_target,
+        )
     actor.move(direction)
     return True
 
@@ -2842,6 +3142,763 @@ def _unit_capacity_blocked(
     }
 
 
+def _bounded_reachable_component(
+    start: Position,
+    blocked: set[Position],
+    max_cells: int = CORE_POCKET_MAX_CELLS,
+) -> tuple[frozenset[Position], bool]:
+    """Return a bounded four-neighbor component and whether it was exhausted."""
+
+    if max_cells <= 0:
+        return frozenset(), False
+    blocked = set(blocked)
+    blocked.discard(start)
+    visited = {start}
+    frontier = deque((start,))
+    while frontier and len(visited) < max_cells:
+        current = frontier.popleft()
+        for direction in CARDINAL_DIRECTIONS:
+            destination = _next_position(current, direction)
+            if destination in blocked or destination in visited:
+                continue
+            visited.add(destination)
+            frontier.append(destination)
+            if len(visited) >= max_cells:
+                break
+    return frozenset(visited), not frontier
+
+
+def _cargo_touches_component(
+    cargo_position: Position,
+    core_position: Position,
+    component: frozenset[Position],
+) -> bool:
+    if cargo_position == core_position:
+        return True
+    return any(
+        _next_position(cargo_position, direction) in component
+        for direction in CARDINAL_DIRECTIONS
+    )
+
+
+def _update_core_pocket(
+    turn: Any,
+    core_position: Position | None,
+    blocked: set[Position],
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+    *,
+    core_accepts_delivery: bool,
+) -> CorePocketObservation:
+    """Classify a persistent closed Core pocket without disrupting normal deposits."""
+
+    tick = int(getattr(turn, "tick", 0))
+    cargo_workers = {
+        str(getattr(worker, "id", "")): worker
+        for worker in getattr(turn, "workers", ())
+        if str(getattr(worker, "id", ""))
+        and int(getattr(worker, "cargo", 0)) > 0
+        and _position(getattr(worker, "position", None)) is not None
+    }
+    if core_position is None:
+        memory.admitted_cargo_progress.clear()
+        memory.core_pocket_candidate_streak = 0
+        memory.core_pocket_candidate_cargo_ids.clear()
+        memory.core_pocket = CorePocketObservation()
+        return memory.core_pocket
+
+    dynamic_blocked = set(blocked) | set(friendly_occupancy)
+    dynamic_blocked.discard(core_position)
+    component, closed = _bounded_reachable_component(
+        core_position,
+        dynamic_blocked,
+    )
+    raw_admitted_ids = {
+        worker_id
+        for worker_id, worker in cargo_workers.items()
+        if _cargo_touches_component(
+            _position(getattr(worker, "position", None)),
+            core_position,
+            component,
+        )
+    }
+
+    deposit_succeeded = any(
+        _event_label(event) == "DEPOSIT_SUCCEEDED"
+        for event in getattr(turn, "events", ())
+    )
+    if deposit_succeeded:
+        memory.admitted_cargo_progress.clear()
+
+    stalled_admitted_ids: set[str] = set()
+    for worker_id in raw_admitted_ids:
+        worker = cargo_workers[worker_id]
+        position = _position(getattr(worker, "position", None))
+        assert position is not None
+        if position == core_position:
+            memory.admitted_cargo_progress.pop(worker_id, None)
+            continue
+        previous = memory.admitted_cargo_progress.get(worker_id)
+        stationary_ticks = (
+            previous.stationary_ticks + 1
+            if previous is not None
+            and previous.last_tick == tick - 1
+            and previous.position == position
+            else 1
+        )
+        memory.admitted_cargo_progress[worker_id] = AdmittedCargoProgress(
+            position=position,
+            stationary_ticks=stationary_ticks,
+            last_tick=tick,
+        )
+        if stationary_ticks >= ADMITTED_CARGO_STALL_TICKS:
+            stalled_admitted_ids.add(worker_id)
+    for worker_id in set(memory.admitted_cargo_progress) - raw_admitted_ids:
+        memory.admitted_cargo_progress.pop(worker_id, None)
+
+    admitted_ids = raw_admitted_ids - stalled_admitted_ids
+    outside_ids = set(cargo_workers) - admitted_ids
+    static_reachable_ids: set[str] = set()
+    if closed and not admitted_ids and core_accepts_delivery:
+        for worker_id in sorted(outside_ids):
+            worker_position = _position(
+                getattr(cargo_workers[worker_id], "position", None)
+            )
+            if worker_position is None:
+                continue
+            static_route = _complete_route(worker_position, core_position, blocked)
+            if static_route.status == "SUCCESS":
+                static_reachable_ids.add(worker_id)
+
+    candidate = bool(
+        closed
+        and not admitted_ids
+        and static_reachable_ids
+        and core_accepts_delivery
+        and not deposit_succeeded
+    )
+    same_sequence = bool(
+        candidate
+        and memory.core_pocket_candidate_tick == tick - 1
+        and memory.core_pocket_candidate_core == core_position
+        and memory.core_pocket_candidate_cargo_ids & static_reachable_ids
+    )
+    if candidate:
+        memory.core_pocket_candidate_streak = (
+            memory.core_pocket_candidate_streak + 1 if same_sequence else 1
+        )
+        memory.core_pocket_candidate_tick = tick
+        memory.core_pocket_candidate_core = core_position
+        memory.core_pocket_candidate_cargo_ids = set(static_reachable_ids)
+    else:
+        memory.core_pocket_candidate_streak = 0
+        memory.core_pocket_candidate_tick = -1
+        memory.core_pocket_candidate_core = None
+        memory.core_pocket_candidate_cargo_ids.clear()
+
+    observation = CorePocketObservation(
+        component=component,
+        closed=closed,
+        raw_admitted_cargo_ids=frozenset(raw_admitted_ids),
+        admitted_cargo_ids=frozenset(admitted_ids),
+        stalled_admitted_cargo_ids=frozenset(stalled_admitted_ids),
+        outside_cargo_ids=frozenset(outside_ids),
+        static_reachable_cargo_ids=frozenset(static_reachable_ids),
+        consecutive_ticks=memory.core_pocket_candidate_streak,
+        blocked=memory.core_pocket_candidate_streak >= CORE_POCKET_DEBOUNCE_TICKS,
+    )
+    memory.core_pocket = observation
+    return observation
+
+
+def _clear_cargo_lane(memory: TacticMemory) -> None:
+    memory.cargo_lane = CargoLanePlan()
+
+
+def _cargo_lane_gateway(
+    core_position: Position,
+    owner_position: Position,
+    static_path: tuple[Position, ...],
+) -> Position | None:
+    if not static_path:
+        return None
+    core_to_owner = tuple(reversed(static_path))
+    gateway = core_position
+    for position in core_to_owner[1:]:
+        if max(
+            abs(position[0] - core_position[0]),
+            abs(position[1] - core_position[1]),
+        ) > CARGO_LANE_RADIUS:
+            break
+        gateway = position
+        if position == owner_position:
+            break
+    return gateway
+
+
+def _local_cargo_lane_bridge(
+    core_position: Position,
+    owner: Any,
+    static_path: tuple[Position, ...],
+    blocked: set[Position],
+    danger_cells: set[Position],
+    units: Iterable[Any],
+) -> CargoLaneBridge | None:
+    """Find a low-disruption path through the bounded Core logistics window."""
+
+    owner_id = str(getattr(owner, "id", ""))
+    owner_position = _position(getattr(owner, "position", None))
+    if not owner_id or owner_position is None:
+        return None
+    gateway = _cargo_lane_gateway(core_position, owner_position, static_path)
+    if gateway is None:
+        return None
+    core_to_owner = tuple(reversed(static_path))
+    try:
+        static_gateway_steps = core_to_owner.index(gateway)
+    except ValueError:
+        return None
+    static_total_steps = max(0, len(static_path) - 1)
+    max_total_steps = static_total_steps + 2
+
+    min_x = core_position[0] - CARGO_LANE_RADIUS
+    max_x = core_position[0] + CARGO_LANE_RADIUS
+    min_y = core_position[1] - CARGO_LANE_RADIUS
+    max_y = core_position[1] + CARGO_LANE_RADIUS
+    hard_blocked = set(blocked) | set(danger_cells)
+    hard_blocked.discard(core_position)
+    units_by_position: dict[Position, list[Any]] = {}
+    worker_ids: set[str] = set()
+    cargo_ids: set[str] = set()
+    for unit in units:
+        unit_id = str(getattr(unit, "id", ""))
+        position = _position(getattr(unit, "position", None))
+        if not unit_id or position is None:
+            continue
+        units_by_position.setdefault(position, []).append(unit)
+        if _enum_label(getattr(unit, "unit_type", "")) == "WORKER":
+            worker_ids.add(unit_id)
+            if int(getattr(unit, "cargo", 0)) > 0:
+                cargo_ids.add(unit_id)
+
+    owner_side_start = (
+        owner_position
+        if min_x <= owner_position[0] <= max_x
+        and min_y <= owner_position[1] <= max_y
+        else gateway
+    )
+    owner_blocked = hard_blocked | set(units_by_position)
+    owner_blocked.discard(owner_side_start)
+    owner_distance_offset = (
+        0
+        if owner_side_start == owner_position
+        else static_path.index(owner_side_start)
+    )
+    owner_distances: dict[Position, int] = {
+        owner_side_start: owner_distance_offset
+    }
+    owner_frontier = deque((owner_side_start,))
+    while owner_frontier:
+        current = owner_frontier.popleft()
+        for direction in CARDINAL_DIRECTIONS:
+            destination = _next_position(current, direction)
+            if not (
+                min_x <= destination[0] <= max_x
+                and min_y <= destination[1] <= max_y
+            ):
+                continue
+            if destination in owner_blocked or destination in owner_distances:
+                continue
+            owner_distances[destination] = owner_distances[current] + 1
+            owner_frontier.append(destination)
+
+    def occupancy_cost(position: Position) -> tuple[int, int, int, int]:
+        occupants = [
+            unit
+            for unit in units_by_position.get(position, ())
+            if str(getattr(unit, "id", "")) != owner_id
+        ]
+        occupant_ids = {str(getattr(unit, "id", "")) for unit in occupants}
+        return (
+            len(occupant_ids),
+            len(occupant_ids & cargo_ids),
+            1,
+            len(occupant_ids & (worker_ids - cargo_ids)),
+        )
+
+    start_cost = (0, 0, 0, 0)
+    costs: dict[Position, tuple[int, int, int, int]] = {core_position: start_cost}
+    parents: dict[Position, Position] = {}
+    sequence = count()
+    frontier: list[tuple[tuple[int, int, int, int], int, Position]] = [
+        (start_cost, next(sequence), core_position)
+    ]
+    best_target: Position | None = None
+    best_target_score: tuple[int, int, int, int] | None = None
+    while frontier:
+        current_cost, _, current = heapq.heappop(frontier)
+        if current_cost != costs.get(current):
+            continue
+        owner_distance = owner_distances.get(current)
+        if owner_distance is not None:
+            total_steps = current_cost[2] + owner_distance
+            target_score = (
+                current_cost[0],
+                current_cost[1],
+                total_steps,
+                current_cost[3],
+            )
+            if total_steps <= max_total_steps and (
+                best_target_score is None or target_score < best_target_score
+            ):
+                best_target = current
+                best_target_score = target_score
+        for direction in CARDINAL_DIRECTIONS:
+            destination = _next_position(current, direction)
+            if not (
+                min_x <= destination[0] <= max_x
+                and min_y <= destination[1] <= max_y
+            ):
+                continue
+            if destination in hard_blocked:
+                continue
+            step_cost = occupancy_cost(destination)
+            new_cost = tuple(
+                current_cost[index] + step_cost[index] for index in range(4)
+            )
+            if new_cost[2] > max_total_steps:
+                continue
+            if new_cost >= costs.get(
+                destination,
+                (sys.maxsize, sys.maxsize, sys.maxsize, sys.maxsize),
+            ):
+                continue
+            costs[destination] = new_cost
+            parents[destination] = current
+            heapq.heappush(
+                frontier,
+                (new_cost, next(sequence), destination),
+            )
+    if best_target is None:
+        return None
+    path = [best_target]
+    while path[-1] != core_position:
+        path.append(parents[path[-1]])
+    path.reverse()
+    blocker_ids = {
+        str(getattr(unit, "id", ""))
+        for position in path
+        for unit in units_by_position.get(position, ())
+        if str(getattr(unit, "id", "")) != owner_id
+    }
+    return CargoLaneBridge(
+        path=tuple(path),
+        gateway=best_target,
+        blocker_ids=frozenset(blocker_ids),
+    )
+
+
+def _cargo_stage_targets(
+    cargo_workers: Iterable[Any],
+    core_position: Position,
+    gateway: Position,
+    lane_path: set[Position],
+    blocked: set[Position],
+    danger_cells: set[Position],
+    friendly_occupancy: dict[Position, int],
+    *,
+    queued_owner_id: str | None = None,
+    admit_queued_to_gateway: bool = False,
+) -> dict[str, Position]:
+    cargo_workers = tuple(cargo_workers)
+    candidates = [
+        position
+        for radius in CARGO_LANE_STAGE_RADII
+        for position in _chebyshev_ring_positions(core_position, radius)
+        if position not in lane_path
+        and position not in blocked
+        and position not in danger_cells
+    ]
+    available = set(candidates)
+    assignments: dict[str, Position] = {}
+    if admit_queued_to_gateway and any(
+        str(getattr(worker, "id", "")) == queued_owner_id
+        for worker in cargo_workers
+    ):
+        assignments[str(queued_owner_id)] = gateway
+    for worker in sorted(
+        cargo_workers,
+        key=lambda item: str(getattr(item, "id", "")),
+    ):
+        worker_id = str(getattr(worker, "id", ""))
+        origin = _position(getattr(worker, "position", None))
+        if not worker_id or origin is None:
+            continue
+        if worker_id in assignments:
+            continue
+        target = min(
+            (
+                position
+                for position in available
+                if friendly_occupancy.get(position, 0) == 0
+                or position == origin
+            ),
+            key=lambda position: (
+                _estimated_path_cost(origin, position, blocked | danger_cells)
+                + _manhattan(position, gateway),
+                _manhattan(position, gateway),
+                position[0],
+                position[1],
+            ),
+            default=None,
+        )
+        if target is None:
+            continue
+        assignments[worker_id] = target
+        available.remove(target)
+    return assignments
+
+
+def _select_cargo_lane_owner(
+    cargo_workers: Iterable[Any],
+    target_position: Position,
+    blocked: set[Position],
+    memory: TacticMemory,
+    *,
+    onward_steps: int = 0,
+) -> tuple[Any | None, RouteSearchResult | None]:
+    candidates: list[tuple[tuple[int, int, int, str], Any, RouteSearchResult]] = []
+    for worker in cargo_workers:
+        worker_id = str(getattr(worker, "id", ""))
+        position = _position(getattr(worker, "position", None))
+        if not worker_id or position is None:
+            continue
+        route = _complete_route(position, target_position, blocked)
+        if route.status != "SUCCESS":
+            continue
+        route_length = max(0, len(route.path) - 1) + max(0, onward_steps)
+        wait_ticks = memory.cargo_lane_wait_ticks.get(worker_id, 0)
+        candidates.append(
+            (
+                (
+                    max(0, route_length - wait_ticks),
+                    -wait_ticks,
+                    route_length,
+                    worker_id,
+                ),
+                worker,
+                route,
+            )
+        )
+    if not candidates:
+        return None, None
+    _, owner, route = min(candidates, key=lambda candidate: candidate[0])
+    return owner, route
+
+
+def _refresh_cargo_lane_occupants(
+    turn: Any,
+    memory: TacticMemory,
+    blocked: set[Position],
+    danger_cells: set[Position],
+    friendly_occupancy: dict[Position, int],
+) -> None:
+    lane = memory.cargo_lane
+    if not lane.active or lane.core_position is None or lane.gateway is None:
+        return
+    workers = tuple(getattr(turn, "workers", ()))
+    lane_positions = set(lane.path)
+    workers_by_id = {
+        str(getattr(worker, "id", "")): worker
+        for worker in workers
+        if str(getattr(worker, "id", ""))
+    }
+    core_neighbors = {
+        _next_position(lane.core_position, direction)
+        for direction in CARDINAL_DIRECTIONS
+    }
+    owner = workers_by_id.get(lane.owner_id or "")
+    owner_position = _position(getattr(owner, "position", None))
+    queued_owner = workers_by_id.get(lane.queued_owner_id or "")
+    queued_owner_has_cargo = bool(
+        queued_owner is not None and int(getattr(queued_owner, "cargo", 0)) > 0
+    )
+    owner_ready_for_queue = bool(
+        owner_position in lane_positions
+        or (
+            owner_position is not None
+            and lane.gateway is not None
+            and _manhattan(owner_position, lane.gateway) == 1
+        )
+    )
+    admit_queued_to_gateway = bool(
+        queued_owner_has_cargo and owner_ready_for_queue
+    )
+    lane.yield_worker_ids = {
+        str(getattr(worker, "id", ""))
+        for worker in workers
+        if str(getattr(worker, "id", "")) != lane.owner_id
+        and _position(getattr(worker, "position", None))
+        in lane_positions | core_neighbors
+        and not (
+            str(getattr(worker, "id", "")) == lane.queued_owner_id
+            and _position(getattr(worker, "position", None)) == lane.gateway
+        )
+    }
+    non_owner_cargo = [
+        worker
+        for worker in workers
+        if int(getattr(worker, "cargo", 0)) > 0
+        and str(getattr(worker, "id", "")) != lane.owner_id
+    ]
+    cargo_ids = {str(getattr(worker, "id", "")) for worker in non_owner_cargo}
+    stages_valid = (
+        set(lane.stage_targets) == cargo_ids
+        and all(
+            target not in blocked
+            and target not in danger_cells
+            and (
+                (
+                    worker_id == lane.queued_owner_id
+                    and admit_queued_to_gateway
+                    and target == lane.gateway
+                )
+                or (
+                    not (
+                        worker_id == lane.queued_owner_id
+                        and admit_queued_to_gateway
+                    )
+                    and target not in lane_positions
+                )
+            )
+            for worker_id, target in lane.stage_targets.items()
+        )
+    )
+    if not stages_valid:
+        lane.stage_targets = _cargo_stage_targets(
+            non_owner_cargo,
+            lane.core_position,
+            lane.gateway,
+            lane_positions,
+            blocked,
+            danger_cells,
+            friendly_occupancy,
+            queued_owner_id=lane.queued_owner_id,
+            admit_queued_to_gateway=admit_queued_to_gateway,
+        )
+
+
+def _update_cargo_lane(
+    turn: Any,
+    core_position: Position | None,
+    blocked: set[Position],
+    danger_cells: set[Position],
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+    *,
+    core_accepts_delivery: bool,
+    threat_level: str,
+) -> CargoLanePlan:
+    tick = int(getattr(turn, "tick", 0))
+    workers = tuple(getattr(turn, "workers", ()))
+    workers_by_id = {
+        str(getattr(worker, "id", "")): worker
+        for worker in workers
+        if str(getattr(worker, "id", ""))
+    }
+    cargo_workers = [
+        worker for worker in workers if int(getattr(worker, "cargo", 0)) > 0
+    ]
+    cargo_ids = {str(getattr(worker, "id", "")) for worker in cargo_workers}
+    for worker_id in cargo_ids:
+        memory.cargo_lane_wait_ticks[worker_id] = (
+            memory.cargo_lane_wait_ticks.get(worker_id, 0) + 1
+        )
+    for worker_id in set(memory.cargo_lane_wait_ticks) - cargo_ids:
+        memory.cargo_lane_wait_ticks.pop(worker_id, None)
+
+    lane = memory.cargo_lane
+    unsafe = threat_level in {"PRE_EVADE", "ENGAGED", "BREAKOUT"}
+    if (
+        core_position is None
+        or unsafe
+        or not core_accepts_delivery
+        or not cargo_workers
+        or (lane.active and lane.core_position != core_position)
+    ):
+        _clear_cargo_lane(memory)
+        return memory.cargo_lane
+
+    owner = workers_by_id.get(lane.owner_id or "") if lane.active else None
+    owner_position = _position(getattr(owner, "position", None))
+    owner_has_cargo = owner is not None and int(getattr(owner, "cargo", 0)) > 0
+    if lane.active and owner is not None and not owner_has_cargo:
+        if owner_position in set(lane.path):
+            lane.yield_worker_ids.add(str(getattr(owner, "id", "")))
+        lane.owner_id = None
+        owner = None
+    elif lane.active and owner is None:
+        lane.owner_id = None
+
+    queued_owner = (
+        workers_by_id.get(lane.queued_owner_id or "") if lane.active else None
+    )
+    if (
+        queued_owner is None
+        or int(getattr(queued_owner, "cargo", 0)) <= 0
+        or str(getattr(queued_owner, "id", "")) == lane.owner_id
+    ):
+        lane.queued_owner_id = None
+        queued_owner = None
+
+    needs_owner = not lane.active or lane.owner_id is None
+    should_activate = memory.core_pocket.blocked or lane.active
+    if needs_owner and should_activate:
+        reuse_existing_bridge = bool(
+            lane.active and lane.path and lane.gateway is not None
+        )
+        selection_target = lane.gateway if reuse_existing_bridge else core_position
+        assert selection_target is not None
+        selection_route = None
+        if reuse_existing_bridge and queued_owner is not None:
+            queued_position = _position(getattr(queued_owner, "position", None))
+            if queued_position is not None:
+                queued_route = _complete_route(
+                    queued_position,
+                    selection_target,
+                    blocked,
+                )
+                if queued_route.status == "SUCCESS":
+                    owner = queued_owner
+                    selection_route = queued_route
+                    lane.queued_owner_id = None
+        if owner is None or selection_route is None:
+            owner, selection_route = _select_cargo_lane_owner(
+                cargo_workers,
+                selection_target,
+                blocked,
+                memory,
+                onward_steps=(
+                    len(lane.path) - 1 if reuse_existing_bridge else 0
+                ),
+            )
+        if owner is None or selection_route is None:
+            _clear_cargo_lane(memory)
+            return memory.cargo_lane
+        owner_id = str(getattr(owner, "id", ""))
+        if reuse_existing_bridge:
+            lane.owner_id = owner_id
+            lane.stage_targets.pop(owner_id, None)
+        else:
+            static_route = selection_route
+            bridge = _local_cargo_lane_bridge(
+                core_position,
+                owner,
+                static_route.path,
+                blocked,
+                danger_cells,
+                getattr(turn, "units", ()),
+            )
+            if bridge is None:
+                _clear_cargo_lane(memory)
+                return memory.cargo_lane
+            lane = CargoLanePlan(
+                active=True,
+                core_position=core_position,
+                owner_id=owner_id,
+                path=bridge.path,
+                gateway=bridge.gateway,
+                started_tick=(
+                    tick if not memory.cargo_lane.active else lane.started_tick
+                ),
+                last_planned_tick=tick,
+            )
+            memory.cargo_lane = lane
+
+    if not memory.cargo_lane.active:
+        return memory.cargo_lane
+
+    lane = memory.cargo_lane
+    if any(position in blocked or position in danger_cells for position in lane.path):
+        owner = workers_by_id.get(lane.owner_id or "")
+        owner_position = _position(getattr(owner, "position", None))
+        if owner is None or owner_position is None:
+            _clear_cargo_lane(memory)
+            return memory.cargo_lane
+        static_route = _complete_route(owner_position, core_position, blocked)
+        if static_route.status != "SUCCESS":
+            _clear_cargo_lane(memory)
+            return memory.cargo_lane
+        bridge = _local_cargo_lane_bridge(
+            core_position,
+            owner,
+            static_route.path,
+            blocked,
+            danger_cells,
+            getattr(turn, "units", ()),
+        )
+        if bridge is None:
+            _clear_cargo_lane(memory)
+            return memory.cargo_lane
+        lane.path = bridge.path
+        lane.gateway = bridge.gateway
+        lane.last_planned_tick = tick
+
+    active_owner = workers_by_id.get(lane.owner_id or "")
+    active_owner_position = _position(getattr(active_owner, "position", None))
+    owner_ready_for_queue = bool(
+        active_owner_position in set(lane.path)
+        or (
+            active_owner_position is not None
+            and lane.gateway is not None
+            and _manhattan(active_owner_position, lane.gateway) == 1
+        )
+    )
+    if not owner_ready_for_queue:
+        lane.queued_owner_id = None
+    else:
+        queued_owner = workers_by_id.get(lane.queued_owner_id or "")
+        queued_position = _position(getattr(queued_owner, "position", None))
+        queued_route = (
+            _complete_route(queued_position, lane.gateway, blocked)
+            if queued_position is not None and lane.gateway is not None
+            else None
+        )
+        if (
+            queued_owner is None
+            or int(getattr(queued_owner, "cargo", 0)) <= 0
+            or str(getattr(queued_owner, "id", "")) == lane.owner_id
+            or queued_route is None
+            or queued_route.status != "SUCCESS"
+        ):
+            remaining_cargo = [
+                worker
+                for worker in cargo_workers
+                if str(getattr(worker, "id", "")) != lane.owner_id
+            ]
+            queued_owner, _ = _select_cargo_lane_owner(
+                remaining_cargo,
+                lane.gateway,
+                blocked,
+                memory,
+                onward_steps=max(0, len(lane.path) - 1),
+            )
+            lane.queued_owner_id = (
+                str(getattr(queued_owner, "id", ""))
+                if queued_owner is not None
+                else None
+            )
+
+    _refresh_cargo_lane_occupants(
+        turn,
+        memory,
+        blocked,
+        danger_cells,
+        friendly_occupancy,
+    )
+    return memory.cargo_lane
+
+
 def _queue_worker_route(
     worker: Any,
     target: Position | None,
@@ -2861,6 +3918,23 @@ def _queue_worker_route(
         reservations,
         actor_origin=origin,
     )
+    if memory.cargo_lane.active and worker_id != memory.cargo_lane.owner_id:
+        gateway = memory.cargo_lane.gateway
+        gateway_was_available = bool(
+            gateway is not None and gateway not in capacity_blocked
+        )
+        capacity_blocked.update(memory.cargo_lane.path)
+        if memory.cargo_lane.core_position is not None:
+            capacity_blocked.update(
+                _next_position(memory.cargo_lane.core_position, direction)
+                for direction in CARDINAL_DIRECTIONS
+            )
+        if (
+            worker_id == memory.cargo_lane.queued_owner_id
+            and gateway_was_available
+        ):
+            capacity_blocked.discard(gateway)
+        capacity_blocked.discard(origin)
     route_blocked.discard(target)
     contested_positions = memory.contested_worker_positions(
         worker_id,
@@ -2882,7 +3956,28 @@ def _queue_worker_route(
     )
     status = result.status if result is not None else "CACHED"
     if status == "BUDGET_EXCEEDED":
-        memory.route_diagnostics[worker_id] = "ROUTE_BUDGET_FALLBACK"
+        capacity_pressure = False
+        if capacity_blocked:
+            static_result = _complete_route(
+                origin,
+                target,
+                static_route_blocked,
+                discouraged=discouraged,
+            )
+            capacity_pressure = static_result.status == "SUCCESS"
+        memory.route_diagnostics[worker_id] = (
+            "CAPACITY_BLOCKED_BUDGET"
+            if capacity_pressure
+            else "ROUTE_BUDGET_FALLBACK"
+        )
+        if (
+            capacity_pressure
+            and role.startswith("CARGO")
+            and (memory.core_pocket.blocked or memory.cargo_lane.active)
+            and worker_id != memory.cargo_lane.queued_owner_id
+        ):
+            memory.worker_routes.pop(worker_id, None)
+            return False, "CAPACITY_BLOCKED_BUDGET", result
         direction = choose_step_direction(
             origin,
             target,
@@ -3072,6 +4167,143 @@ def _unit_max_hp(unit_type: UnitType) -> int:
     return 4 if unit_type == UnitType.VANGUARD else 2
 
 
+def _critical_combat_hp(unit_type: UnitType) -> int:
+    if unit_type == UnitType.VANGUARD:
+        return 2
+    if unit_type == UnitType.RANGER:
+        return 1
+    return 0
+
+
+def _is_critical_combat_unit(unit: Any) -> bool:
+    threshold = _critical_combat_hp(getattr(unit, "unit_type", None))
+    return threshold > 0 and int(getattr(unit, "hp", 0)) <= threshold
+
+
+def _critical_combat_escape_direction(
+    actor: Any,
+    enemies: Iterable[Any],
+    obstacles: set[Position],
+    enemy_occupied_positions: set[Position],
+    core_position: Position | None,
+    reserved_destinations: Any,
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+    tick: int,
+) -> Direction | None:
+    """Choose an immediately safer legal step for a critically wounded defender."""
+
+    origin = _position(getattr(actor, "position", None))
+    if origin is None:
+        return None
+    combat_enemies = list(enemies)
+    current_damage = _projected_incoming_damage(origin, combat_enemies, obstacles)
+    if current_damage <= 0:
+        return None
+    enemy_positions = {
+        position
+        for position in (
+            _position(getattr(enemy, "position", None)) for enemy in combat_enemies
+        )
+        if position is not None
+    }
+    capacity_blocked = _unit_capacity_blocked(
+        friendly_occupancy,
+        reserved_destinations,
+        actor_origin=origin,
+    )
+    hard_blocked = (
+        set(obstacles)
+        | set(enemy_occupied_positions)
+        | capacity_blocked
+        | memory.contested_unit_positions(getattr(actor, "id", ""), tick)
+    )
+    candidates: list[tuple[tuple[int, int, int, int], Direction]] = []
+    for index, direction in enumerate(CARDINAL_DIRECTIONS):
+        destination = _next_position(origin, direction)
+        if destination in hard_blocked:
+            continue
+        projected_damage = _projected_incoming_damage(
+            destination,
+            combat_enemies,
+            obstacles,
+        )
+        core_distance = (
+            _manhattan(destination, core_position)
+            if core_position is not None
+            else 0
+        )
+        nearest_enemy = min(
+            (
+                _manhattan(destination, enemy_position)
+                for enemy_position in enemy_positions
+            ),
+            default=PATH_COST_UNREACHABLE,
+        )
+        candidates.append(
+            (
+                (projected_damage, core_distance, -nearest_enemy, index),
+                direction,
+            )
+        )
+    if not candidates:
+        return None
+    best_score, best_direction = min(candidates, key=lambda candidate: candidate[0])
+    if best_score[0] >= current_damage:
+        return None
+    return best_direction
+
+
+def _queue_critical_combat_escape(
+    actor: Any,
+    enemies: Iterable[Any],
+    obstacles: set[Position],
+    enemy_occupied_positions: set[Position],
+    core_position: Position | None,
+    reserved_destinations: Any,
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+    tick: int,
+) -> bool:
+    direction = _critical_combat_escape_direction(
+        actor,
+        enemies,
+        obstacles,
+        enemy_occupied_positions,
+        core_position,
+        reserved_destinations,
+        friendly_occupancy,
+        memory,
+        tick,
+    )
+    origin = _position(getattr(actor, "position", None))
+    if direction is None or origin is None:
+        return False
+    destination = _next_position(origin, direction)
+    if reserved_destinations is not None:
+        _reserve_destination(reserved_destinations, destination)
+    memory.note_unit_move(
+        getattr(actor, "id", ""),
+        destination,
+        core_position or destination,
+    )
+    actor.move(direction)
+    return True
+
+
+def _register_critical_healing(
+    turn: Any,
+    unit: Any,
+    memory: TacticMemory,
+    core_position: Position | None,
+) -> None:
+    if core_position is None or not _is_critical_combat_unit(unit):
+        return
+    missing_hp = _unit_max_hp(unit.unit_type) - int(getattr(unit, "hp", 0))
+    if int(getattr(turn, "resources", 0)) >= UNIT_HEAL_RESOURCE_RESERVE + missing_hp:
+        memory.healing_defender_ids.add(str(getattr(unit, "id", "")))
+
+
 def _refresh_healing_defenders(
     turn: Any,
     memory: TacticMemory,
@@ -3120,6 +4352,50 @@ def _adjacent_direction(origin: Position, target: Position) -> Direction | None:
     if abs(dx) + abs(dy) != 1:
         return None
     return _direction_for_delta(dx, dy)
+
+
+def _vanguard_stationary_approach_position(
+    actor: Any,
+    target: Position,
+    movement_blocked: set[Position],
+    reserved_destinations: Any,
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+    tick: int,
+) -> Position | None:
+    """Choose a reachable empty cell from which a Vanguard can sweep."""
+
+    origin = _position(getattr(actor, "position", None))
+    if origin is None:
+        return None
+    capacity_blocked = _unit_capacity_blocked(
+        friendly_occupancy,
+        reserved_destinations,
+        actor_origin=origin,
+    )
+    route_blocked = (
+        set(movement_blocked)
+        | capacity_blocked
+        | memory.contested_unit_positions(getattr(actor, "id", ""), tick)
+    )
+    route_blocked.discard(origin)
+    candidates: list[tuple[int, int, int, Position]] = []
+    for direction in CARDINAL_DIRECTIONS:
+        position = _next_position(target, direction)
+        if position in route_blocked:
+            continue
+        route = _complete_route(origin, position, route_blocked)
+        if route.status != "SUCCESS":
+            continue
+        candidates.append(
+            (
+                len(route.path) - 1,
+                position[0],
+                position[1],
+                position,
+            )
+        )
+    return min(candidates)[3] if candidates else None
 
 
 def _aligned_in_range(origin: Position, target: Position, max_range: int = 3) -> bool:
@@ -3404,6 +4680,86 @@ def _raid_attack_assignments(
     return assignments, set(assignments), vanguard_idle + ranger_idle
 
 
+def _raid_assignment_invalid_reason(
+    raid: CoreRaidPlan,
+    combat_by_id: dict[str, Any],
+    target: Position,
+    blocked: set[Position],
+    danger_cells: set[Position],
+    enemy_positions: set[Position],
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+    tick: int,
+) -> str | None:
+    if set(raid.assignments) != raid.raid_member_ids:
+        return "MISSING_ASSIGNMENT"
+    if len(set(raid.assignments.values())) != len(raid.assignments):
+        return "DUPLICATE_ASSIGNMENT"
+    for member_id in sorted(raid.raid_member_ids):
+        unit = combat_by_id.get(member_id)
+        assignment = raid.assignments.get(member_id)
+        origin = _position(getattr(unit, "position", None))
+        if unit is None or assignment is None or origin is None:
+            return "MISSING_MEMBER"
+        unit_type = getattr(unit, "unit_type", None)
+        if unit_type == UnitType.VANGUARD:
+            if _manhattan(assignment, target) != 1:
+                return "INVALID_ATTACK_CELL"
+        elif unit_type == UnitType.RANGER:
+            if not _aligned_in_range(assignment, target) or not _path_is_clear(
+                assignment,
+                target,
+                blocked,
+            ):
+                return "INVALID_ATTACK_CELL"
+        else:
+            return "INVALID_MEMBER_TYPE"
+        if assignment in blocked or assignment in danger_cells or assignment in enemy_positions:
+            return "HARD_BLOCKED"
+        occupied_by_others = _unit_capacity_blocked(
+            friendly_occupancy,
+            actor_origin=origin,
+        )
+        if assignment in occupied_by_others:
+            return "FRIENDLY_OCCUPIED"
+        avoided = memory.contested_unit_positions(member_id, tick)
+        if assignment in avoided:
+            return "RECENT_MOVE_FAILURE"
+        route_blocked = (
+            set(blocked)
+            | danger_cells
+            | enemy_positions
+            | occupied_by_others
+            | avoided
+        )
+        route_blocked.discard(origin)
+        route = _complete_route(origin, assignment, route_blocked)
+        if (
+            route.status != "SUCCESS"
+            or len(route.path) - 1 > CORE_RAID_MAX_PATH_COST
+        ):
+            return "UNREACHABLE"
+    return None
+
+
+def _raid_formation_cost(
+    raid: CoreRaidPlan,
+    combat_by_id: dict[str, Any],
+    blocked: set[Position],
+    danger_cells: set[Position],
+    enemy_positions: set[Position],
+) -> int:
+    return sum(
+        _estimated_path_cost(
+            _position(getattr(combat_by_id[member_id], "position", None)),
+            raid.assignments[member_id],
+            blocked | danger_cells | enemy_positions,
+        )
+        for member_id in raid.raid_member_ids
+        if member_id in combat_by_id and member_id in raid.assignments
+    )
+
+
 def _raid_target_durability(target: Any, visible_enemies: Iterable[Any]) -> int:
     target_position = _position(getattr(target, "position", None))
     target_id = str(getattr(target, "id", ""))
@@ -3597,10 +4953,8 @@ def _update_core_raid_plan(
             _abort_raid(memory, tick)
             return visible_target
         if getattr(unit, "unit_type", None) == UnitType.RANGER and hp <= 1:
-            retreat_tick = raid.ranger_retreat_after_tick.setdefault(member_id, tick + 1)
-            if tick >= retreat_tick:
-                _abort_raid(memory, tick)
-                return visible_target
+            _abort_raid(memory, tick)
+            return visible_target
 
     handoff_complete = (
         visible_target is not None
@@ -3690,27 +5044,60 @@ def _update_core_raid_plan(
         and int(getattr(core, "shield", 0) or 0) >= 4
         and int(getattr(turn, "resources", 0)) >= UNIT_HEAL_RESOURCE_RESERVE
     )
-    if raid.state == "CORE_STAGING" and not raid.assignments and roster_ready:
-        assignments, members, idle_count = _raid_attack_assignments(
-            turn,
-            memory,
-            core_position,
-            target_position,
-            blocked,
-            danger_cells,
-            visible_enemies,
-            friendly_occupancy,
-        )
-        vanguard_ids = {
-            str(getattr(unit, "id", "")) for unit in vanguards
-        }
+    if raid.state == "CORE_STAGING":
+        if core_position is None:
+            _abort_raid(memory, tick)
+            return visible_target
+        vanguard_ids = {str(getattr(unit, "id", "")) for unit in vanguards}
         ranger_ids = {str(getattr(unit, "id", "")) for unit in rangers}
-        if len(members & vanguard_ids) >= 2 and len(members & ranger_ids) >= 2:
+
+        def install_staging_assignments(reason: str) -> bool:
+            assignments, members, idle_count = _raid_attack_assignments(
+                turn,
+                memory,
+                core_position,
+                target_position,
+                blocked,
+                danger_cells,
+                visible_enemies,
+                friendly_occupancy,
+            )
+            if len(members & vanguard_ids) < 2 or len(members & ranger_ids) < 2:
+                return False
             raid.assignments = assignments
             raid.raid_member_ids = members
+            raid.last_replan_tick = tick
+            raid.last_replan_reason = reason
             memory.guard_idle_assignments += idle_count
+            return True
 
-    if raid.state == "CORE_STAGING" and raid.raid_member_ids:
+        if not raid.assignments and roster_ready:
+            install_staging_assignments("INITIAL")
+
+        if raid.raid_member_ids:
+            invalid_reason = _raid_assignment_invalid_reason(
+                raid,
+                combat_by_id,
+                target_position,
+                blocked,
+                danger_cells,
+                enemy_positions,
+                friendly_occupancy,
+                memory,
+                tick,
+            )
+            if invalid_reason is not None and not install_staging_assignments(
+                invalid_reason
+            ):
+                _abort_raid(memory, tick)
+                return visible_target
+
+        if not raid.raid_member_ids:
+            raid.stalled_ticks += 1
+            if raid.stalled_ticks >= CORE_RAID_STALL_TICKS:
+                _abort_raid(memory, tick)
+            return visible_target
+
         if all(
             member_id in combat_by_id
             and _position(getattr(combat_by_id[member_id], "position", None))
@@ -3727,20 +5114,36 @@ def _update_core_raid_plan(
             _set_raid_state(memory, "CORE_RAID", tick)
             return visible_target
 
+        formation_cost = _raid_formation_cost(
+            raid,
+            combat_by_id,
+            blocked,
+            danger_cells,
+            enemy_positions,
+        )
+        if raid.last_formation_cost is None:
+            raid.stalled_ticks = 0
+        elif formation_cost < raid.last_formation_cost:
+            raid.stalled_ticks = 0
+        else:
+            raid.stalled_ticks += 1
+        raid.last_formation_cost = formation_cost
+        if raid.stalled_ticks >= CORE_RAID_STALL_TICKS:
+            _abort_raid(memory, tick)
+        return visible_target
+
     if raid.state == "CORE_RAID":
         durability = (
             _raid_target_durability(visible_target, visible_enemies)
             if visible_target is not None
             else None
         )
-        formation_cost = sum(
-            _estimated_path_cost(
-                _position(getattr(combat_by_id[member_id], "position", None)),
-                raid.assignments[member_id],
-                blocked | danger_cells,
-            )
-            for member_id in raid.raid_member_ids
-            if member_id in combat_by_id and member_id in raid.assignments
+        formation_cost = _raid_formation_cost(
+            raid,
+            combat_by_id,
+            blocked,
+            danger_cells,
+            enemy_positions,
         )
         progressed = (
             durability is not None
@@ -3968,6 +5371,113 @@ def _core_lane_outward_direction(
     return max(candidates, key=lambda candidate: candidate[0])[1]
 
 
+def _cargo_lane_yield_direction(
+    origin: Position,
+    core_position: Position,
+    lane_path: set[Position],
+    blocked: set[Position],
+    reservations: Any,
+    friendly_occupancy: dict[Position, int],
+) -> Direction | None:
+    capacity_blocked = _unit_capacity_blocked(
+        friendly_occupancy,
+        reservations,
+        actor_origin=origin,
+    )
+    current_distance = _manhattan(origin, core_position)
+    candidates: list[tuple[tuple[int, int, int], Direction]] = []
+    for index, direction in enumerate(CARDINAL_DIRECTIONS):
+        destination = _next_position(origin, direction)
+        if destination == core_position or destination in lane_path:
+            continue
+        if destination in blocked or destination in capacity_blocked:
+            continue
+        distance = _manhattan(destination, core_position)
+        candidates.append(
+            (
+                (
+                    int(distance >= current_distance),
+                    distance,
+                    -index,
+                ),
+                direction,
+            )
+        )
+    if not candidates:
+        search_blocked = set(blocked) | capacity_blocked | {core_position}
+        search_blocked.discard(origin)
+        frontier = deque((origin,))
+        visited = {origin}
+        first_direction: dict[Position, Direction] = {}
+        max_distance = 4
+        while frontier:
+            current = frontier.popleft()
+            for direction in CARDINAL_DIRECTIONS:
+                destination = _next_position(current, direction)
+                if destination in visited or destination in search_blocked:
+                    continue
+                if _manhattan(destination, origin) > max_distance:
+                    continue
+                visited.add(destination)
+                first_direction[destination] = first_direction.get(
+                    current,
+                    direction,
+                )
+                if destination not in lane_path:
+                    return first_direction[destination]
+                frontier.append(destination)
+        return None
+    return max(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def _queue_cargo_lane_owner_step(
+    worker: Any,
+    lane: CargoLanePlan,
+    blocked: set[Position],
+    reservations: Any,
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+) -> bool:
+    origin = _position(getattr(worker, "position", None))
+    worker_id = str(getattr(worker, "id", ""))
+    if origin is None or not worker_id or lane.gateway is None:
+        return False
+    if origin not in lane.path:
+        moved, _, _ = _queue_worker_route(
+            worker,
+            lane.gateway,
+            "CARGO_LANE_APPROACH",
+            blocked,
+            reservations,
+            friendly_occupancy,
+            memory,
+        )
+        return moved
+    path_index = lane.path.index(origin)
+    if path_index <= 0:
+        return False
+    destination = lane.path[path_index - 1]
+    capacity_blocked = _unit_capacity_blocked(
+        friendly_occupancy,
+        reservations,
+        actor_origin=origin,
+    )
+    if destination in blocked or destination in capacity_blocked:
+        memory.route_diagnostics[worker_id] = (
+            "CAPACITY_BLOCKED"
+            if destination in capacity_blocked
+            else "CARGO_LANE_BLOCKED"
+        )
+        return False
+    direction = _direction_between(origin, destination)
+    if direction is None:
+        return False
+    _reserve_destination(reservations, destination)
+    worker.move(direction)
+    memory.note_worker_move(worker_id, destination)
+    return True
+
+
 def _update_core_lane_clearance(
     workers: list[Any],
     core_position: Position | None,
@@ -4164,8 +5674,18 @@ def _plan_workers(
     planning_workers = sorted(
         workers,
         key=lambda worker: (
-            str(getattr(worker, "id", ""))
-            != memory.core_lane_departing_worker_id,
+            (
+                0
+                if str(getattr(worker, "id", ""))
+                == memory.core_lane_departing_worker_id
+                else 1
+                if str(getattr(worker, "id", ""))
+                in memory.cargo_lane.yield_worker_ids
+                else 2
+                if str(getattr(worker, "id", ""))
+                == memory.cargo_lane.owner_id
+                else 3
+            ),
             str(getattr(worker, "id", "")),
         ),
     )
@@ -4278,6 +5798,64 @@ def _plan_workers(
                     memory.note_worker_move(worker_key, destination)
                     continue
             worker.wait()
+            continue
+
+        lane = memory.cargo_lane
+        if (
+            lane.active
+            and lane.core_position is not None
+            and worker_key in lane.yield_worker_ids
+            and worker_position is not None
+        ):
+            direction = _cargo_lane_yield_direction(
+                worker_position,
+                lane.core_position,
+                set(lane.path),
+                worker_return_blocked | contested_positions,
+                reserved_destinations,
+                friendly_occupancy,
+            )
+            if direction is not None:
+                destination = _next_position(worker_position, direction)
+                _reserve_destination(reserved_destinations, destination)
+                worker.move(direction)
+                memory.note_worker_move(worker_key, destination)
+            else:
+                worker.wait()
+            continue
+
+        if (
+            lane.active
+            and cargo > 0
+            and worker_position is not None
+            and core_position is not None
+            and not (worker_key == lane.owner_id and worker_position == core_position)
+        ):
+            if worker_key == lane.owner_id:
+                moved = _queue_cargo_lane_owner_step(
+                    worker,
+                    lane,
+                    worker_return_blocked | contested_positions,
+                    reserved_destinations,
+                    friendly_occupancy,
+                    memory,
+                )
+            else:
+                stage_target = lane.stage_targets.get(worker_key)
+                if stage_target is None or worker_position == stage_target:
+                    worker.wait()
+                    continue
+                moved, _, _ = _queue_worker_route(
+                    worker,
+                    stage_target,
+                    "CARGO_STAGE",
+                    worker_return_blocked,
+                    reserved_destinations,
+                    friendly_occupancy,
+                    memory,
+                )
+            if not moved:
+                worker.wait()
             continue
 
         if cargo > 0:
@@ -4629,6 +6207,7 @@ def _plan_vanguards(
     raid_target: Any | None,
 ) -> None:
     movement_blocked = blocked | danger_cells | enemy_occupied_positions
+    tick = int(getattr(turn, "tick", 0))
     for slot, vanguard in enumerate(
         sorted(getattr(turn, "vanguards", ()), key=lambda unit: str(unit.id))
     ):
@@ -4638,6 +6217,24 @@ def _plan_vanguards(
             continue
 
         vanguard_key = str(getattr(vanguard, "id", ""))
+        _register_critical_healing(
+            turn,
+            vanguard,
+            memory,
+            core_position,
+        )
+        if _is_critical_combat_unit(vanguard) and _queue_critical_combat_escape(
+            vanguard,
+            enemies,
+            blocked,
+            enemy_occupied_positions,
+            core_position,
+            reserved_destinations,
+            friendly_occupancy,
+            memory,
+            tick,
+        ):
+            continue
         if vanguard_key in memory.raid.raid_member_ids:
             if memory.raid.state == "CORE_RECALL":
                 if core_position is not None and _chebyshev(origin, core_position) > 3:
@@ -4647,6 +6244,8 @@ def _plan_vanguards(
                         movement_blocked,
                         reserved_destinations,
                         friendly_occupancy=friendly_occupancy,
+                        memory=memory,
+                        tick=tick,
                     ):
                         continue
                 vanguard.wait()
@@ -4664,10 +6263,31 @@ def _plan_vanguards(
                 movement_blocked,
                 reserved_destinations,
                 friendly_occupancy=friendly_occupancy,
+                memory=memory,
+                tick=tick,
             ):
                 continue
             vanguard.wait()
             continue
+
+        healing_return = (
+            vanguard_key in memory.healing_defender_ids
+            and core_position is not None
+        )
+        if healing_return:
+            if origin == core_position:
+                vanguard.heal()
+                continue
+            if _queue_move(
+                vanguard,
+                core_position,
+                movement_blocked,
+                reserved_destinations,
+                friendly_occupancy=friendly_occupancy,
+                memory=memory,
+                tick=tick,
+            ):
+                continue
 
         if enabled and enemies:
             adjacent = [
@@ -4684,17 +6304,8 @@ def _plan_vanguards(
                 vanguard.sweep(_adjacent_direction(origin, _position(target.position)))
                 continue
 
-        if vanguard_key in memory.healing_defender_ids and core_position is not None:
-            if origin == core_position:
-                vanguard.heal()
-            elif not _queue_move(
-                vanguard,
-                core_position,
-                movement_blocked,
-                reserved_destinations,
-                friendly_occupancy=friendly_occupancy,
-            ):
-                vanguard.wait()
+        if healing_return:
+            vanguard.wait()
             continue
 
         if enabled and allow_stationary_clear and slot > 0:
@@ -4710,12 +6321,24 @@ def _plan_vanguards(
                 if _adjacent_direction(origin, target_position) is not None:
                     vanguard.sweep(_adjacent_direction(origin, target_position))
                     continue
-                if _queue_move(
+                approach_position = _vanguard_stationary_approach_position(
                     vanguard,
                     target_position,
                     movement_blocked,
                     reserved_destinations,
+                    friendly_occupancy,
+                    memory,
+                    tick,
+                )
+                if approach_position is not None and _queue_move(
+                    vanguard,
+                    approach_position,
+                    movement_blocked,
+                    reserved_destinations,
                     friendly_occupancy=friendly_occupancy,
+                    memory=memory,
+                    tick=tick,
+                    stationary_target=target_position,
                 ):
                     continue
 
@@ -4727,6 +6350,8 @@ def _plan_vanguards(
                 movement_blocked,
                 reserved_destinations,
                 friendly_occupancy=friendly_occupancy,
+                memory=memory,
+                tick=tick,
             ):
                 continue
 
@@ -4739,6 +6364,8 @@ def _plan_vanguards(
                 movement_blocked,
                 reserved_destinations,
                 friendly_occupancy=friendly_occupancy,
+                memory=memory,
+                tick=tick,
             ):
                 continue
         vanguard.wait()
@@ -4765,6 +6392,7 @@ def _plan_rangers(
     raid_target: Any | None,
 ) -> None:
     movement_blocked = blocked | danger_cells | enemy_occupied_positions
+    tick = int(getattr(turn, "tick", 0))
     for slot, ranger in enumerate(
         sorted(getattr(turn, "rangers", ()), key=lambda unit: str(unit.id))
     ):
@@ -4774,6 +6402,24 @@ def _plan_rangers(
             continue
 
         ranger_key = str(getattr(ranger, "id", ""))
+        _register_critical_healing(
+            turn,
+            ranger,
+            memory,
+            core_position,
+        )
+        if _is_critical_combat_unit(ranger) and _queue_critical_combat_escape(
+            ranger,
+            enemies,
+            blocked,
+            enemy_occupied_positions,
+            core_position,
+            reserved_destinations,
+            friendly_occupancy,
+            memory,
+            tick,
+        ):
+            continue
         if ranger_key in memory.raid.raid_member_ids:
             if memory.raid.state == "CORE_RECALL":
                 if core_position is not None and _chebyshev(origin, core_position) > 3:
@@ -4783,6 +6429,8 @@ def _plan_rangers(
                         movement_blocked,
                         reserved_destinations,
                         friendly_occupancy=friendly_occupancy,
+                        memory=memory,
+                        tick=tick,
                     ):
                         continue
                 ranger.wait()
@@ -4803,10 +6451,31 @@ def _plan_rangers(
                 movement_blocked,
                 reserved_destinations,
                 friendly_occupancy=friendly_occupancy,
+                memory=memory,
+                tick=tick,
             ):
                 continue
             ranger.wait()
             continue
+
+        healing_return = (
+            ranger_key in memory.healing_defender_ids
+            and core_position is not None
+        )
+        if healing_return:
+            if origin == core_position:
+                ranger.heal()
+                continue
+            if _queue_move(
+                ranger,
+                core_position,
+                movement_blocked,
+                reserved_destinations,
+                friendly_occupancy=friendly_occupancy,
+                memory=memory,
+                tick=tick,
+            ):
+                continue
 
         if enabled:
             targets = [
@@ -4844,17 +6513,8 @@ def _plan_rangers(
                 ranger.shoot(target)
                 continue
 
-        if ranger_key in memory.healing_defender_ids and core_position is not None:
-            if origin == core_position:
-                ranger.heal()
-            elif not _queue_move(
-                ranger,
-                core_position,
-                movement_blocked,
-                reserved_destinations,
-                friendly_occupancy=friendly_occupancy,
-            ):
-                ranger.wait()
+        if healing_return:
+            ranger.wait()
             continue
 
         if core_position is not None:
@@ -4865,6 +6525,8 @@ def _plan_rangers(
                 movement_blocked,
                 reserved_destinations,
                 friendly_occupancy=friendly_occupancy,
+                memory=memory,
+                tick=tick,
             ):
                 continue
 
@@ -4877,6 +6539,8 @@ def _plan_rangers(
                 movement_blocked,
                 reserved_destinations,
                 friendly_occupancy=friendly_occupancy,
+                memory=memory,
+                tick=tick,
             ):
                 continue
         ranger.wait()
@@ -5013,7 +6677,7 @@ def _plan_core(
         return
 
     population = _population(turn)
-    spawn_type = _choose_spawn_unit(turn, config)
+    spawn_type = _choose_spawn_unit(turn, config, pending_delivery)
     spawn_cost = _unit_cost(spawn_type, population) if spawn_type is not None else None
     population_allowed = (
         config.max_population <= 0 or population < config.max_population
@@ -5066,8 +6730,22 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         visible_enemies,
         int(turn.tick),
     )
+    enemy_core_positions = {
+        position
+        for position in (
+            _position(getattr(enemy, "position", None))
+            for enemy in visible_enemies
+            if _is_enemy_core(enemy)
+        )
+        if position is not None
+    }
     stationary_targets = [
-        target for target in stationary_targets if not _is_enemy_core(target)
+        target
+        for target in stationary_targets
+        if not _is_enemy_core(target)
+        and _position(getattr(target, "position", None)) not in enemy_core_positions
+        and _position(getattr(target, "position", None))
+        not in memory.stationary_clear_cooldowns
     ]
     allow_stationary_clear = _allow_stationary_clear(
         threat,
@@ -5095,6 +6773,31 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         threat,
         beacon,
         memory,
+    )
+
+    core_accepts_delivery = bool(
+        core is not None
+        and not _core_is_moving(core)
+        and planned_core_move is None
+        and _resource_space(turn) > 0
+    )
+    _update_core_pocket(
+        turn,
+        _position(getattr(core, "position", None)),
+        blocked,
+        friendly_occupancy,
+        memory,
+        core_accepts_delivery=core_accepts_delivery,
+    )
+    _update_cargo_lane(
+        turn,
+        _position(getattr(core, "position", None)),
+        blocked,
+        danger_cells | memory.recent_worker_return_danger(int(turn.tick)),
+        friendly_occupancy,
+        memory,
+        core_accepts_delivery=core_accepts_delivery,
+        threat_level=threat.level,
     )
 
     pending_delivery = _plan_workers(
@@ -5135,6 +6838,22 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         for unit in getattr(turn, "rangers", ())
         if str(getattr(unit, "id", "")) not in memory.raid.raid_member_ids
     ]
+    core_logistics_apron = (
+        {
+            _next_position(core_position, direction)
+            for direction in CARDINAL_DIRECTIONS
+        }
+        if core_position is not None
+        else set()
+    )
+    if memory.cargo_lane.active and core_position is not None:
+        core_logistics_apron.update(
+            _chebyshev_ring_positions(core_position, 1)
+        )
+        core_logistics_apron.update(memory.cargo_lane.path)
+        core_logistics_apron.update(memory.cargo_lane.stage_targets.values())
+        core_logistics_apron.discard(core_position)
+    core_logistics_apron.update(memory.planned_worker_destinations.values())
     vanguard_guards, vanguard_guard_positions, vanguard_idle = _assign_guard_posts(
         defending_vanguards,
         core_position,
@@ -5143,7 +6862,7 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         danger_cells,
         resource_cells,
         enemy_positions,
-        set(),
+        core_logistics_apron,
         friendly_occupancy,
     )
     ranger_guards, _, ranger_idle = _assign_guard_posts(
@@ -5154,7 +6873,7 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         danger_cells,
         resource_cells,
         enemy_positions,
-        vanguard_guard_positions,
+        vanguard_guard_positions | core_logistics_apron,
         friendly_occupancy,
     )
     memory.guard_idle_assignments += vanguard_idle + ranger_idle
@@ -5198,7 +6917,7 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         enemy_positions,
         raid_target,
     )
-    spawn_type = _choose_spawn_unit(turn, config)
+    spawn_type = _choose_spawn_unit(turn, config, pending_delivery)
     spawn_cost = (
         _unit_cost(spawn_type, _population(turn))
         if spawn_type is not None
@@ -5568,6 +7287,34 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Strategy population cap; 0 disables it. The game itself has no population cap.",
     )
     parser.add_argument(
+        "--population-expansion",
+        choices=["ON", "OFF"],
+        default=_env_setting("ARENA_HERO_POPULATION_EXPANSION", "OFF").upper(),
+        help="Continue proportional 8:3:4 growth after configured roster targets.",
+    )
+    parser.add_argument(
+        "--expansion-threshold",
+        type=int,
+        default=int(
+            _env_setting(
+                "ARENA_HERO_EXPANSION_RESOURCE_THRESHOLD",
+                str(POPULATION_EXPANSION_RESOURCE_FLOOR),
+            )
+        ),
+        help="Minimum available resources required for optional population growth.",
+    )
+    parser.add_argument(
+        "--expansion-casualty-buffer",
+        type=int,
+        default=int(
+            _env_setting(
+                "ARENA_HERO_EXPANSION_CASUALTY_BUFFER_UNITS",
+                str(POPULATION_EXPANSION_CASUALTY_BUFFER_UNITS),
+            )
+        ),
+        help="Units of spare post-casualty capacity protected by the expansion gate.",
+    )
+    parser.add_argument(
         "--worker-target",
         type=int,
         default=int(
@@ -5683,6 +7430,9 @@ def main(argv: list[str] | None = None) -> int:
         max_population=max(0, args.max_population),
         spawn_unit_type=configured_spawn_type,
         auto_production=automatic_production,
+        population_expansion_enabled=args.population_expansion == "ON",
+        expansion_resource_threshold=max(0, args.expansion_threshold),
+        expansion_casualty_buffer_units=max(0, args.expansion_casualty_buffer),
         worker_target=max(0, args.worker_target),
         vanguard_target=max(0, args.vanguard_target),
         ranger_target=max(0, args.ranger_target),
@@ -5712,6 +7462,14 @@ def main(argv: list[str] | None = None) -> int:
         else UNIT_LABELS.get(config.spawn_unit_type, "\u5173\u95ed")
     )
     combat_label = "\u5f00\u542f" if config.enable_combat else "\u5173\u95ed"
+    expansion_label = (
+        (
+            f"ON(threshold={config.expansion_resource_threshold},"
+            f"casualty_buffer={config.expansion_casualty_buffer_units})"
+        )
+        if config.population_expansion_enabled
+        else "OFF"
+    )
     population_label = (
         "\u4e0d\u9650\u5236" if config.max_population <= 0 else str(config.max_population)
     )
@@ -5722,6 +7480,7 @@ def main(argv: list[str] | None = None) -> int:
         spawn_label,
         combat_label,
     )
+    LOGGER.info("Population expansion=%s", expansion_label)
     _log_sdk_compatibility()
 
     _install_protocol_compatibility()
