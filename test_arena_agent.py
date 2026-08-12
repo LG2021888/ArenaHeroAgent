@@ -3205,7 +3205,55 @@ class ArenaAgentTests(unittest.TestCase):
 
         self.assertIsNotNone(route)
         self.assertEqual(route[:4], lane.path)
-        self.assertEqual(route[-1], (4, 0))
+        self.assertNotIn(route[-1], friendly_occupancy)
+        self.assertTrue(
+            _cargo_lane_egress_complete(
+                route[-1],
+                lane,
+                blocked,
+                friendly_occupancy,
+            )
+        )
+
+    def test_cargo_lane_extends_a_dynamically_closed_egress_endpoint(self):
+        lane = CargoLanePlan(
+            active=True,
+            phase="EGRESS",
+            core_position=(0, 0),
+            departing_worker_id="departing",
+            path=((0, 0), (1, 0), (2, 0), (3, 0)),
+            gateway=(3, 0),
+            egress_path=((0, 0), (1, 0), (2, 0), (3, 0), (4, 0)),
+            egress_target=(4, 0),
+        )
+        blocked = {(4, -1), (4, 1), (5, -1), (5, 1)}
+        friendly_occupancy = {(3, 0): 1, (4, 0): 1, (5, 0): 1}
+
+        self.assertFalse(
+            _cargo_lane_egress_complete(
+                (4, 0),
+                lane,
+                blocked,
+                friendly_occupancy,
+            )
+        )
+
+        route = _cargo_lane_egress_route(
+            (4, 0),
+            lane,
+            blocked,
+            friendly_occupancy,
+        )
+
+        self.assertEqual(route, ((4, 0), (5, 0), (6, 0)))
+        self.assertTrue(
+            _cargo_lane_egress_complete(
+                route[-1],
+                lane,
+                blocked,
+                friendly_occupancy,
+            )
+        )
 
     def test_cargo_lane_egress_clears_friendly_occupied_corridor(self):
         departing = FakeActor("departing", (0, 0), cargo=0)

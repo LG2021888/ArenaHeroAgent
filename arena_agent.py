@@ -3731,26 +3731,53 @@ def _cargo_lane_egress_route(
 ) -> tuple[Position, ...] | None:
     if lane.core_position is None or lane.gateway is None:
         return None
-    # Plan through temporary friendly occupancy so the lane controller can
-    # mark those Units for yielding. Actual movement still enforces capacity.
-    route_blocked = set(blocked)
-    route_blocked.discard(start)
-    to_gateway = _complete_route(start, lane.gateway, route_blocked)
-    if to_gateway.status != "SUCCESS":
+    if start in lane.path:
+        prefix = lane.path[lane.path.index(start) :]
+        search_start = lane.gateway
+    else:
+        prefix = (start,)
+        search_start = start
+
+    # Search through temporary friendly occupancy so those Units can be told
+    # to yield, but only finish at a currently open, unoccupied component.
+    route_blocked = set(blocked) | set(lane.path)
+    route_blocked.discard(search_start)
+    visited = {search_start}
+    parents: dict[Position, Position] = {}
+    frontier = deque((search_start,))
+    target = None
+    while frontier and len(visited) < CORE_POCKET_MAX_CELLS:
+        current = frontier.popleft()
+        current_occupancy = friendly_occupancy.get(current, 0) - int(
+            current == start
+        )
+        if (
+            current_occupancy <= 0
+            and _cargo_lane_egress_complete(
+                current,
+                lane,
+                blocked,
+                friendly_occupancy,
+            )
+        ):
+            target = current
+            break
+        for direction in CARDINAL_DIRECTIONS:
+            destination = _next_position(current, direction)
+            if destination in route_blocked or destination in visited:
+                continue
+            parents[destination] = current
+            visited.add(destination)
+            frontier.append(destination)
+            if len(visited) >= CORE_POCKET_MAX_CELLS:
+                break
+    if target is None:
         return None
-    outward_blocked = set(blocked) | set(lane.path)
-    outward_blocked.discard(lane.gateway)
-    outward = _cargo_lane_open_route(
-        lane.gateway,
-        lane.core_position,
-        set(lane.path),
-        outward_blocked,
-        {},
-        block_core=True,
-    )
-    if outward is None:
-        return None
-    return to_gateway.path + outward[1:]
+    outward = [target]
+    while outward[-1] != search_start:
+        outward.append(parents[outward[-1]])
+    outward.reverse()
+    return prefix + tuple(outward[1:])
 
 
 def _cargo_lane_startup_workers(
@@ -4075,7 +4102,9 @@ def _update_cargo_lane(
         departing = workers_by_id.get(lane.departing_worker_id)
         departing_position = _position(getattr(departing, "position", None))
         if departing_position is not None and (
-            not lane.egress_path or departing_position not in lane.egress_path
+            not lane.egress_path
+            or departing_position not in lane.egress_path
+            or departing_position == lane.egress_path[-1]
         ):
             route = _cargo_lane_egress_route(
                 departing_position,
