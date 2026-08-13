@@ -46,9 +46,11 @@ from arena_agent import (
     _queue_move,
     _reconnect_delay,
     _save_tactic_memory,
+    _select_cargo_lane_owner,
     _submit_turn_with_retry,
     _trace_event,
     _update_core_pocket,
+    _update_cargo_lane,
     _single_open_cargo_lane_path,
     _unit_cost,
     _worker_escape_direction,
@@ -3288,6 +3290,167 @@ class ArenaAgentTests(unittest.TestCase):
             ),
             f"history={history}",
         )
+
+    def test_cargo_lane_owner_admission_rejects_distant_wait_credit(self):
+        near = FakeActor("near", (4, 0), cargo=1)
+        far = FakeActor("far", (58, 0), cargo=1)
+        memory = TacticMemory(cargo_lane_wait_ticks={"near": 65, "far": 90})
+
+        owner, route = _select_cargo_lane_owner(
+            (far, near),
+            (0, 0),
+            set(),
+            memory,
+        )
+
+        self.assertIs(owner, near)
+        self.assertEqual(len(route.path) - 1, 4)
+
+    def test_cargo_lane_wait_credit_is_capped_before_route_tiebreak(self):
+        near = FakeActor("near", (1, 0), cargo=1)
+        farther = FakeActor("farther", (8, 0), cargo=1)
+        memory = TacticMemory(
+            cargo_lane_wait_ticks={"near": 1, "farther": 100}
+        )
+
+        owner, route = _select_cargo_lane_owner(
+            (farther, near),
+            (0, 0),
+            set(),
+            memory,
+        )
+
+        self.assertIs(owner, near)
+        self.assertEqual(len(route.path) - 1, 1)
+
+    def test_cargo_lane_owner_admission_falls_back_to_nearest(self):
+        nearer = FakeActor("nearer", (9, 0), cargo=1)
+        farther = FakeActor("farther", (20, 0), cargo=1)
+        memory = TacticMemory(cargo_lane_wait_ticks={"farther": 100})
+
+        owner, route = _select_cargo_lane_owner(
+            (farther, nearer),
+            (0, 0),
+            set(),
+            memory,
+        )
+
+        self.assertIs(owner, nearer)
+        self.assertEqual(len(route.path) - 1, 9)
+
+    def test_cargo_lane_wait_credit_counts_only_staged_rejections(self):
+        owner = FakeActor("owner", (1, 0), cargo=1)
+        staged = FakeActor("staged", (3, 1), cargo=1)
+        approaching = FakeActor("approaching", (20, 0), cargo=1)
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        turn = make_turn(
+            worker=owner,
+            core=core,
+            obstacles=frozenset({(0, -1), (-1, 0), (0, 1)}),
+        )
+        turn.workers = (owner, staged, approaching)
+        turn.units = turn.workers
+        turn.state.population = len(turn.units)
+        memory = TacticMemory(
+            cargo_lane=CargoLanePlan(
+                active=True,
+                phase="INBOUND",
+                core_position=(0, 0),
+                owner_id="owner",
+                path=((0, 0), (1, 0), (2, 0), (3, 0)),
+                gateway=(3, 0),
+                stage_targets={
+                    "staged": (3, 1),
+                    "approaching": (4, 1),
+                },
+            ),
+            cargo_lane_wait_ticks={
+                "owner": 5,
+                "staged": 5,
+                "approaching": 5,
+            },
+        )
+
+        _update_cargo_lane(
+            turn,
+            (0, 0),
+            {(0, -1), (-1, 0), (0, 1)},
+            set(),
+            _friendly_cell_occupancy(turn),
+            memory,
+            core_accepts_delivery=True,
+            core_stable=True,
+            threat_level="NORMAL",
+        )
+
+        self.assertNotIn("owner", memory.cargo_lane_wait_ticks)
+        self.assertEqual(memory.cargo_lane_wait_ticks["staged"], 6)
+        self.assertNotIn("approaching", memory.cargo_lane_wait_ticks)
+
+    def test_queued_cargo_survives_egress_and_is_promoted_directly(self):
+        departing = FakeActor("departing", (2, 0), cargo=0)
+        queued = FakeActor("queued", (3, 1), cargo=1)
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        blocked = {(0, -1), (-1, 0), (0, 1)}
+        turn = make_turn(
+            worker=departing,
+            core=core,
+            obstacles=frozenset(blocked),
+        )
+        turn.workers = (departing, queued)
+        turn.units = turn.workers
+        turn.state.population = len(turn.units)
+        memory = TacticMemory(
+            cargo_lane=CargoLanePlan(
+                active=True,
+                phase="EGRESS",
+                core_position=(0, 0),
+                queued_owner_id="queued",
+                departing_worker_id="departing",
+                path=((0, 0), (1, 0), (2, 0), (3, 0)),
+                gateway=(3, 0),
+                stage_targets={"queued": (3, 1)},
+            ),
+            cargo_lane_wait_ticks={"queued": 5},
+        )
+
+        _update_cargo_lane(
+            turn,
+            (0, 0),
+            blocked,
+            set(),
+            _friendly_cell_occupancy(turn),
+            memory,
+            core_accepts_delivery=True,
+            core_stable=True,
+            threat_level="NORMAL",
+        )
+
+        self.assertEqual(memory.cargo_lane.phase, "EGRESS")
+        self.assertEqual(memory.cargo_lane.queued_owner_id, "queued")
+        self.assertIsNone(memory.cargo_lane.owner_id)
+
+        departing.position = (4, 0)
+        turn.tick += 1
+        _update_cargo_lane(
+            turn,
+            (0, 0),
+            blocked,
+            set(),
+            _friendly_cell_occupancy(turn),
+            memory,
+            core_accepts_delivery=True,
+            core_stable=True,
+            threat_level="NORMAL",
+        )
+
+        self.assertEqual(memory.cargo_lane.phase, "INBOUND")
+        self.assertEqual(memory.cargo_lane.owner_id, "queued")
+        self.assertIsNone(memory.cargo_lane.queued_owner_id)
+        self.assertIsNone(memory.cargo_lane.departing_worker_id)
+        self.assertNotIn("queued", memory.cargo_lane_wait_ticks)
 
     def test_cargo_lane_dead_pocket_is_not_egress_complete(self):
         lane = CargoLanePlan(
