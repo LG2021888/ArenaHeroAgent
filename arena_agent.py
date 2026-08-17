@@ -71,6 +71,17 @@ RESOURCE_COOLDOWN_TICKS = 8
 # detour can keep moving as long as its remaining cost is falling.
 SCOUT_NO_MOVE_TICKS = 4
 SCOUT_PATH_STALL_TICKS = 3
+SCOUT_RETURN_STALL_TICKS = 8
+SCOUT_INJURED_MAX_DISTANCE = 40
+SCOUT_RISK_MEMORY_TICKS = 96
+HEAL_VISIT_TIMEOUT_TICKS = 12
+HEAL_INTENT_TIMEOUT_TICKS = 12
+HEAL_INTENT_COOLDOWN_TICKS = 12
+HEAL_PRIORITY_DEPOSIT_LIMIT = 3
+DEFENDER_HEAL_ADMISSION_TIMEOUT_TICKS = 16
+DEFENDER_HEAL_COOLDOWN_TICKS = 12
+CARGO_LANE_INBOUND_WATCHDOG_TICKS = 16
+CARGO_LANE_EGRESS_WATCHDOG_TICKS = 16
 SCOUT_POSITION_HISTORY_SIZE = 6
 SCOUT_RECENT_POSITION_PENALTY = 4
 STATIONARY_CONFIRMATION_TICKS = 2
@@ -377,6 +388,13 @@ class ScoutProgress:
     last_cost: int | None = None
 
 
+@dataclass
+class ScoutReturnProgress:
+    target: Position
+    best_cost: int
+    last_improved_tick: int
+
+
 @dataclass(frozen=True)
 class ThreatAssessment:
     level: str = "NORMAL"
@@ -489,13 +507,34 @@ class CargoLanePlan:
     departing_worker_id: str | None = None
     path: tuple[Position, ...] = ()
     gateway: Position | None = None
+    owner_approach_path: tuple[Position, ...] = ()
+    heal_approach_path: tuple[Position, ...] = ()
     egress_path: tuple[Position, ...] = ()
     egress_target: Position | None = None
     startup_pending_ids: set[str] = field(default_factory=set)
     yield_worker_ids: set[str] = field(default_factory=set)
+    yield_unit_ids: set[str] = field(default_factory=set)
     stage_targets: dict[str, Position] = field(default_factory=dict)
     started_tick: int = 0
+    phase_started_tick: int = 0
     last_planned_tick: int = -1
+    geometry_source: str = "UNKNOWN"
+    watchdog_tick: int = -1
+    watchdog_reason: str | None = None
+    owner_progress_id: str | None = None
+    owner_best_remaining_steps: int | None = None
+    owner_last_progress_tick: int = -1
+    departing_progress_id: str | None = None
+    departing_best_remaining_steps: int | None = None
+    departing_last_progress_tick: int = -1
+
+
+@dataclass
+class CoreVisit:
+    unit_id: str | None = None
+    purpose: str | None = None
+    granted_tick: int = -1
+    reached_core: bool = field(default=False, compare=False)
 
 
 @dataclass
@@ -530,6 +569,7 @@ class TacticMemory:
     resource_cooldowns: dict[Position, int] = field(default_factory=dict)
     exploration_anchor: Position | None = None
     scout_chunk_last_seen: dict[Position, int] = field(default_factory=dict)
+    scout_risk_chunks: dict[Position, int] = field(default_factory=dict)
     scout_stages: dict[str, int] = field(default_factory=dict)
     scout_progress: dict[str, ScoutProgress] = field(default_factory=dict)
     enemy_observation_memory: dict[str, tuple[int, Position]] = field(default_factory=dict)
@@ -547,9 +587,27 @@ class TacticMemory:
         str, tuple[int, Position, int, str]
     ] = field(default_factory=dict)
     scout_return_targets: dict[str, Position] = field(default_factory=dict)
+    scout_return_progress: dict[str, ScoutReturnProgress] = field(default_factory=dict)
+    scout_return_hold_ids: set[str] = field(default_factory=set)
     scout_cooldowns: dict[str, int] = field(default_factory=dict)
     worker_position_history: dict[str, list[Position]] = field(default_factory=dict)
     healing_defender_ids: set[str] = field(default_factory=set)
+    healing_defender_intent_id: str | None = None
+    healing_defender_intent_tick: int = -1
+    healing_defender_stage_target: Position | None = None
+    healing_defender_admitted_id: str | None = None
+    healing_defender_admitted_tick: int = -1
+    healing_defender_best_distance: int | None = None
+    healing_defender_last_progress_tick: int = -1
+    healing_defender_last_position: Position | None = None
+    healing_defender_cooldowns: dict[str, int] = field(default_factory=dict)
+    healing_worker_ids: set[str] = field(default_factory=set)
+    # A healing intent is a queue reservation, not physical Core ownership.
+    # Only a worker standing on the Core cell may populate core_visit.
+    heal_intent_id: str | None = None
+    heal_intent_tick: int = -1
+    heal_intent_best_distance: int | None = None
+    heal_intent_cooldowns: dict[str, int] = field(default_factory=dict)
     last_core_escape_direction: Direction | None = None
     enemy_core_memory: dict[str, EnemyCoreObservation] = field(default_factory=dict)
     enemy_core_revision: int = 0
@@ -579,6 +637,10 @@ class TacticMemory:
     core_pocket_candidate_cargo_ids: set[str] = field(default_factory=set)
     core_pocket_candidate_streak: int = 0
     cargo_lane: CargoLanePlan = field(default_factory=CargoLanePlan)
+    core_visit: CoreVisit = field(default_factory=CoreVisit)
+    core_visit_deposit_streak: int = 0
+    core_visit_forced_purpose: str | None = None
+    heal_priority_intent_id: str | None = None
     cargo_lane_wait_ticks: dict[str, int] = field(default_factory=dict)
     core_lane_departing_worker_id: str | None = None
     core_lane_yield_worker_ids: set[str] = field(default_factory=set)
@@ -607,6 +669,105 @@ class TacticMemory:
             for unit in getattr(turn, "units", ())
             if getattr(unit, "id", None) is not None
         }
+        living_defender_ids = {
+            str(getattr(unit, "id", ""))
+            for unit in tuple(getattr(turn, "vanguards", ()))
+            + tuple(getattr(turn, "rangers", ()))
+            if getattr(unit, "id", None) is not None
+        }
+        if self.healing_defender_admitted_id not in living_defender_ids:
+            self.healing_defender_admitted_id = None
+            self.healing_defender_admitted_tick = -1
+            self.healing_defender_best_distance = None
+            self.healing_defender_last_progress_tick = -1
+            self.healing_defender_last_position = None
+        self.healing_defender_ids.intersection_update(living_defender_ids)
+        self.healing_defender_cooldowns = {
+            defender_id: expires_at
+            for defender_id, expires_at in self.healing_defender_cooldowns.items()
+            if defender_id in living_defender_ids and expires_at > tick
+        }
+        if self.core_visit.unit_id not in living_unit_ids:
+            if self.core_visit.unit_id == self.healing_defender_admitted_id:
+                self.healing_defender_admitted_id = None
+                self.healing_defender_admitted_tick = -1
+                self.healing_defender_best_distance = None
+                self.healing_defender_last_progress_tick = -1
+                self.healing_defender_last_position = None
+            self.core_visit = CoreVisit()
+        else:
+            visit_unit = next(
+                (
+                    unit
+                    for unit in getattr(turn, "units", ())
+                    if str(getattr(unit, "id", "")) == self.core_visit.unit_id
+                ),
+                None,
+            )
+            core_position = _position(
+                getattr(getattr(turn, "core", None), "position", None)
+            )
+            unit_position = _position(getattr(visit_unit, "position", None))
+            deposit_finished = self.core_visit.purpose == "DEPOSIT" and (
+                core_position is None
+                or unit_position != core_position
+                or int(getattr(visit_unit, "cargo", 0)) <= 0
+            )
+            heal_finished = self.core_visit.purpose == "HEAL" and (
+                int(getattr(visit_unit, "hp", 0))
+                >= _unit_max_hp(getattr(visit_unit, "unit_type", UnitType.WORKER))
+            )
+            if self.core_visit.purpose == "HEAL" and unit_position == core_position:
+                self.core_visit.reached_core = True
+            heal_left_core = (
+                self.core_visit.purpose == "HEAL"
+                and self.core_visit.reached_core
+                and unit_position != core_position
+            )
+            heal_timed_out = (
+                self.core_visit.purpose == "HEAL"
+                and not self.core_visit.reached_core
+                and tick - self.core_visit.granted_tick >= HEAL_VISIT_TIMEOUT_TICKS
+            )
+            if visit_unit is None or deposit_finished or heal_finished or heal_left_core or heal_timed_out:
+                if self.core_visit.purpose == "DEPOSIT":
+                    self.core_visit_deposit_streak += 1
+                elif self.core_visit.purpose == "HEAL":
+                    healing_defender_visit = (
+                        self.core_visit.unit_id
+                        == self.healing_defender_admitted_id
+                        or self.core_visit.unit_id in self.healing_defender_ids
+                    )
+                    self.core_visit_deposit_streak = 0
+                    self.core_visit_forced_purpose = None
+                    self.heal_priority_intent_id = None
+                    if heal_timed_out and self.heal_intent_id == self.core_visit.unit_id:
+                        self.heal_intent_cooldowns[self.heal_intent_id] = (
+                            tick + HEAL_INTENT_COOLDOWN_TICKS
+                        )
+                        self.heal_intent_id = None
+                        self.heal_intent_tick = -1
+                        self.heal_intent_best_distance = None
+                    if healing_defender_visit:
+                        defender_id = self.core_visit.unit_id
+                        if heal_finished:
+                            self.healing_defender_ids.discard(defender_id)
+                            self.healing_defender_intent_id = None
+                            self.healing_defender_intent_tick = -1
+                            self.healing_defender_stage_target = None
+                        elif defender_id == self.healing_defender_admitted_id:
+                            self.healing_defender_cooldowns[defender_id] = (
+                                tick + DEFENDER_HEAL_COOLDOWN_TICKS
+                            )
+                            self.healing_defender_intent_id = None
+                            self.healing_defender_intent_tick = -1
+                            self.healing_defender_stage_target = None
+                        self.healing_defender_admitted_id = None
+                        self.healing_defender_admitted_tick = -1
+                        self.healing_defender_best_distance = None
+                        self.healing_defender_last_progress_tick = -1
+                        self.healing_defender_last_position = None
+                self.core_visit = CoreVisit()
         living_worker_ids: set[str] = set()
         for worker in getattr(turn, "workers", ()):
             worker_key = str(getattr(worker, "id", ""))
@@ -625,6 +786,58 @@ class TacticMemory:
             self.cargo_recovery.pop(worker_key, None)
             self.admitted_cargo_progress.pop(worker_key, None)
             self.core_observer_return_ids.discard(worker_key)
+        self.scout_return_targets = {
+            worker_key: target
+            for worker_key, target in self.scout_return_targets.items()
+            if worker_key in living_worker_ids
+        }
+        self.scout_return_progress = {
+            worker_key: progress
+            for worker_key, progress in self.scout_return_progress.items()
+            if worker_key in living_worker_ids
+        }
+        self.scout_return_hold_ids.intersection_update(living_worker_ids)
+        if self.heal_intent_id not in living_worker_ids:
+            self.heal_intent_id = None
+            self.heal_intent_tick = -1
+            self.heal_intent_best_distance = None
+        if self.heal_intent_id is not None:
+            intent_worker = next(
+                (
+                    worker
+                    for worker in getattr(turn, "workers", ())
+                    if str(getattr(worker, "id", "")) == self.heal_intent_id
+                ),
+                None,
+            )
+            intent_position = _position(getattr(intent_worker, "position", None))
+            intent_core_position = _position(
+                getattr(getattr(turn, "core", None), "position", None)
+            )
+            if intent_position is not None and intent_core_position is not None:
+                intent_distance = _manhattan(intent_position, intent_core_position)
+                if (
+                    self.heal_intent_best_distance is None
+                    or intent_distance < self.heal_intent_best_distance
+                ):
+                    self.heal_intent_best_distance = intent_distance
+                    self.heal_intent_tick = tick
+        if (
+            self.heal_intent_id is not None
+            and self.heal_intent_tick >= 0
+            and tick - self.heal_intent_tick >= HEAL_INTENT_TIMEOUT_TICKS
+        ):
+            self.heal_intent_cooldowns[self.heal_intent_id] = (
+                tick + HEAL_INTENT_COOLDOWN_TICKS
+            )
+            self.heal_intent_id = None
+            self.heal_intent_tick = -1
+            self.heal_intent_best_distance = None
+        self.heal_intent_cooldowns = {
+            worker_id: expires_at
+            for worker_id, expires_at in self.heal_intent_cooldowns.items()
+            if worker_id in living_worker_ids and expires_at > tick
+        }
         for unit_key in set(self.unit_contested_positions) - living_unit_ids:
             self.unit_contested_positions.pop(unit_key, None)
             self.stationary_move_failures.pop(unit_key, None)
@@ -974,6 +1187,16 @@ class TacticMemory:
             observed_positions.add(core_position)
         for position in observed_positions:
             self.scout_chunk_last_seen[_chunk_coordinates(position)] = tick
+        for enemy in getattr(turn, "visible_enemies", ()):
+            enemy_position = _position(getattr(enemy, "position", None))
+            if enemy_position is None or not _is_mobile_combat_enemy(enemy):
+                continue
+            self.scout_risk_chunks[_chunk_coordinates(enemy_position)] = tick
+            for danger_position in _enemy_danger_cells(
+                (enemy,),
+                self.obstacle_memory,
+            ):
+                self.scout_risk_chunks[_chunk_coordinates(danger_position)] = tick
         for position, expires_at in tuple(self.resource_cooldowns.items()):
             if expires_at <= tick:
                 self.resource_cooldowns.pop(position, None)
@@ -985,6 +1208,9 @@ class TacticMemory:
         ):
             if tick - observed_at > RECENT_ATTACK_MEMORY_TICKS:
                 self.recent_combat_danger_positions.pop(position, None)
+        for chunk, observed_at in tuple(self.scout_risk_chunks.items()):
+            if tick - observed_at > SCOUT_RISK_MEMORY_TICKS:
+                self.scout_risk_chunks.pop(chunk, None)
         for worker_key, positions in tuple(self.worker_contested_positions.items()):
             for position, expires_at in tuple(positions.items()):
                 if expires_at <= tick:
@@ -1043,12 +1269,49 @@ class TacticMemory:
         }
 
     def begin_scout_return(self, actor_id: Any, core_position: Position) -> None:
-        self.scout_return_targets[str(actor_id)] = core_position
+        worker_key = str(actor_id)
+        self.scout_return_targets[worker_key] = core_position
+        self.scout_return_progress.pop(worker_key, None)
+        self.scout_return_hold_ids.discard(worker_key)
 
     def clear_scout_return(self, actor_id: Any, tick: int) -> None:
         worker_key = str(actor_id)
         self.scout_return_targets.pop(worker_key, None)
+        self.scout_return_progress.pop(worker_key, None)
+        self.scout_return_hold_ids.discard(worker_key)
         self.scout_cooldowns[worker_key] = tick + 3
+
+    def release_scout_return(self, actor_id: Any, tick: int, *, hold: bool) -> None:
+        worker_key = str(actor_id)
+        self.scout_return_targets.pop(worker_key, None)
+        self.scout_return_progress.pop(worker_key, None)
+        if hold:
+            self.scout_return_hold_ids.add(worker_key)
+        else:
+            self.scout_return_hold_ids.discard(worker_key)
+            self.scout_cooldowns[worker_key] = tick + 3
+
+    def note_scout_return_progress(
+        self,
+        actor_id: Any,
+        target: Position,
+        route_cost: int,
+        tick: int,
+    ) -> bool:
+        worker_key = str(actor_id)
+        progress = self.scout_return_progress.get(worker_key)
+        if progress is None or progress.target != target:
+            self.scout_return_progress[worker_key] = ScoutReturnProgress(
+                target=target,
+                best_cost=route_cost,
+                last_improved_tick=tick,
+            )
+            return False
+        if route_cost < progress.best_cost:
+            progress.best_cost = route_cost
+            progress.last_improved_tick = tick
+            return False
+        return tick - progress.last_improved_tick >= SCOUT_RETURN_STALL_TICKS
 
     def scout_is_cooling_down(self, actor_id: Any, tick: int) -> bool:
         return self.scout_cooldowns.get(str(actor_id), 0) > tick
@@ -1198,6 +1461,11 @@ class TacticMemory:
             candidates: list[tuple[tuple[int, ...], Position]] = []
             for chunk in chunks:
                 if chunk in excluded_chunks:
+                    continue
+                if (
+                    chunk in self.scout_risk_chunks
+                    and 0 <= tick - self.scout_risk_chunks[chunk] <= SCOUT_RISK_MEMORY_TICKS
+                ):
                     continue
                 target = _scout_chunk_waypoint(anchor, chunk)
                 if target == origin or target in excluded_targets:
@@ -1580,10 +1848,25 @@ def _worker_mode(worker: Any, memory: TacticMemory, tick: int) -> str:
         return "CARGO_RETURN"
     if worker_key in memory.core_observer_return_ids:
         return "CORE_RECALL"
-    if worker_key in memory.scout_return_targets:
-        return "SCOUT_RETURN"
     if memory.raid.observer_id == worker_key:
         return "CORE_OBSERVER"
+    if (
+        worker_key in memory.healing_worker_ids
+        and memory.heal_intent_id == worker_key
+    ):
+        return "HEAL_RETURN"
+    return_target = memory.scout_return_targets.get(worker_key)
+    if (
+        return_target is not None
+        and worker_key in memory.resource_intents
+        and (worker_position := _position(getattr(worker, "position", None))) is not None
+        and _manhattan(worker_position, return_target) <= CARGO_LANE_STAGE_RADII[-1]
+    ):
+        return "RESOURCE"
+    if return_target is not None:
+        return "SCOUT_RETURN"
+    if worker_key in memory.scout_return_hold_ids:
+        return "HEAL_WAIT"
     if worker_key in memory.resource_intents:
         return "RESOURCE"
     if memory.scout_is_cooling_down(worker_key, tick):
@@ -1843,6 +2126,47 @@ class SessionRecorder:
                 worker_id: _json_position(target)
                 for worker_id, target in sorted(memory.scout_return_targets.items())
             },
+            "scout_return_progress": {
+                worker_id: {
+                    "target": _json_position(progress.target),
+                    "best_cost": progress.best_cost,
+                    "last_improved_tick": progress.last_improved_tick,
+                }
+                for worker_id, progress in sorted(memory.scout_return_progress.items())
+            },
+            "healing_worker_ids": sorted(memory.healing_worker_ids),
+            "healing_defenders": {
+                "candidate_ids": sorted(memory.healing_defender_ids),
+                "intent_id": memory.healing_defender_intent_id,
+                "intent_tick": memory.healing_defender_intent_tick,
+                "stage_target": _json_position(
+                    memory.healing_defender_stage_target
+                ),
+                "admitted_id": memory.healing_defender_admitted_id,
+                "admitted_tick": memory.healing_defender_admitted_tick,
+                "last_progress_tick": (
+                    memory.healing_defender_last_progress_tick
+                ),
+                "last_position": _json_position(
+                    memory.healing_defender_last_position
+                ),
+                "approach_path": [
+                    _json_position(position)
+                    for position in memory.cargo_lane.heal_approach_path
+                ],
+            },
+            "heal_intent": {
+                "unit_id": memory.heal_intent_id,
+                "queued_tick": memory.heal_intent_tick,
+            },
+            "core_visit": {
+                "unit_id": memory.core_visit.unit_id,
+                "purpose": memory.core_visit.purpose,
+                "granted_tick": memory.core_visit.granted_tick,
+                "deposit_streak": memory.core_visit_deposit_streak,
+                "forced_purpose": memory.core_visit_forced_purpose,
+                "heal_priority_intent_id": memory.heal_priority_intent_id,
+            },
             "scout_progress": {
                 worker_id: {
                     "target": _json_position(progress.target),
@@ -1886,18 +2210,41 @@ class SessionRecorder:
                 "departing_worker_id": lane.departing_worker_id,
                 "path": [_json_position(position) for position in lane.path],
                 "gateway": _json_position(lane.gateway),
+                "owner_approach_path": [
+                    _json_position(position)
+                    for position in lane.owner_approach_path
+                ],
+                "heal_approach_path": [
+                    _json_position(position)
+                    for position in lane.heal_approach_path
+                ],
                 "egress_path": [
                     _json_position(position) for position in lane.egress_path
                 ],
                 "egress_target": _json_position(lane.egress_target),
                 "startup_pending_ids": sorted(lane.startup_pending_ids),
                 "yield_worker_ids": sorted(lane.yield_worker_ids),
+                "yield_unit_ids": sorted(lane.yield_unit_ids),
                 "stage_targets": {
                     worker_id: _json_position(target)
                     for worker_id, target in sorted(lane.stage_targets.items())
                 },
                 "started_tick": lane.started_tick,
+                "phase_started_tick": lane.phase_started_tick,
                 "last_planned_tick": lane.last_planned_tick,
+                "geometry_source": lane.geometry_source,
+                "watchdog_tick": lane.watchdog_tick,
+                "watchdog_reason": lane.watchdog_reason,
+                "owner_progress_id": lane.owner_progress_id,
+                "owner_best_remaining_steps": (
+                    lane.owner_best_remaining_steps
+                ),
+                "owner_last_progress_tick": lane.owner_last_progress_tick,
+                "departing_progress_id": lane.departing_progress_id,
+                "departing_best_remaining_steps": (
+                    lane.departing_best_remaining_steps
+                ),
+                "departing_last_progress_tick": lane.departing_last_progress_tick,
             }
         active_contested = {
             worker_id: [
@@ -3878,6 +4225,7 @@ def _select_cargo_lane_departing_worker(
     workers_by_id: dict[str, Any],
     blocked: set[Position],
     friendly_occupancy: dict[Position, int],
+    tick: int,
 ) -> None:
     if lane.core_position is None:
         return
@@ -3904,7 +4252,378 @@ def _select_cargo_lane_departing_worker(
     lane.departing_worker_id = worker_id
     lane.egress_path = route
     lane.egress_target = route[-1]
-    lane.phase = "STARTUP_EVACUATION"
+    _set_cargo_lane_phase(lane, "STARTUP_EVACUATION", tick)
+
+
+def _set_cargo_lane_phase(lane: CargoLanePlan, phase: str, tick: int) -> None:
+    if lane.phase != phase:
+        lane.phase = phase
+        lane.phase_started_tick = tick
+
+
+def _reset_cargo_lane_owner_progress(
+    lane: CargoLanePlan,
+    tick: int = -1,
+) -> None:
+    lane.owner_progress_id = lane.owner_id
+    lane.owner_best_remaining_steps = None
+    lane.owner_last_progress_tick = tick
+
+
+def _cargo_lane_owner_stalled(
+    lane: CargoLanePlan,
+    position: Position | None,
+    blocked: set[Position],
+    tick: int,
+) -> bool:
+    owner_id = lane.owner_id
+    if (
+        lane.phase != "INBOUND"
+        or owner_id is None
+        or position is None
+        or lane.gateway is None
+    ):
+        _reset_cargo_lane_owner_progress(lane)
+        return False
+    if lane.owner_progress_id != owner_id:
+        _reset_cargo_lane_owner_progress(lane, tick)
+    if position in lane.path:
+        remaining_steps = lane.path.index(position)
+    else:
+        route = _complete_route(position, lane.gateway, blocked)
+        remaining_steps = (
+            len(route.path) - 1 + max(0, len(lane.path) - 1)
+            if route.status == "SUCCESS"
+            else _manhattan(position, lane.gateway) + max(0, len(lane.path) - 1)
+        )
+    if (
+        lane.owner_best_remaining_steps is None
+        or remaining_steps < lane.owner_best_remaining_steps
+    ):
+        lane.owner_best_remaining_steps = remaining_steps
+        lane.owner_last_progress_tick = tick
+        return False
+    return (
+        lane.owner_last_progress_tick >= 0
+        and tick - lane.owner_last_progress_tick
+        >= CARGO_LANE_INBOUND_WATCHDOG_TICKS
+    )
+
+
+def _reset_cargo_lane_departing_progress(
+    lane: CargoLanePlan,
+    tick: int = -1,
+) -> None:
+    lane.departing_progress_id = lane.departing_worker_id
+    lane.departing_best_remaining_steps = None
+    lane.departing_last_progress_tick = tick
+
+
+def _cargo_lane_departing_stalled(
+    lane: CargoLanePlan,
+    position: Position | None,
+    tick: int,
+) -> bool:
+    departing_id = lane.departing_worker_id
+    if departing_id is None or position is None or not lane.egress_path:
+        _reset_cargo_lane_departing_progress(lane)
+        return False
+    if lane.departing_progress_id != departing_id:
+        _reset_cargo_lane_departing_progress(lane, tick)
+    try:
+        path_index = lane.egress_path.index(position)
+    except ValueError:
+        remaining_steps = (
+            _manhattan(position, lane.egress_target)
+            if lane.egress_target is not None
+            else None
+        )
+    else:
+        remaining_steps = len(lane.egress_path) - path_index - 1
+    if remaining_steps is None:
+        return False
+    if (
+        lane.departing_best_remaining_steps is None
+        or remaining_steps < lane.departing_best_remaining_steps
+    ):
+        lane.departing_best_remaining_steps = remaining_steps
+        lane.departing_last_progress_tick = tick
+        return False
+    return (
+        lane.phase == "EGRESS"
+        and lane.departing_last_progress_tick >= 0
+        and tick - lane.departing_last_progress_tick
+        >= CARGO_LANE_EGRESS_WATCHDOG_TICKS
+    )
+
+
+def _healing_priority_worker(
+    turn: Any,
+    core_position: Position | None,
+    blocked: set[Position],
+    danger_cells: set[Position],
+    memory: TacticMemory,
+) -> Any | None:
+    if core_position is None or memory.heal_intent_id is None:
+        return None
+    worker = next(
+        (
+            candidate
+            for candidate in getattr(turn, "workers", ())
+            if str(getattr(candidate, "id", "")) == memory.heal_intent_id
+        ),
+        None,
+    )
+    position = _position(getattr(worker, "position", None))
+    missing_hp = _unit_max_hp(UnitType.WORKER) - int(getattr(worker, "hp", 0))
+    if (
+        worker is None
+        or position is None
+        or missing_hp <= 0
+        or int(getattr(worker, "cargo", 0)) > 0
+        or int(getattr(turn, "resources", 0)) < UNIT_HEAL_RESOURCE_RESERVE + missing_hp
+        or _chebyshev(position, core_position) > max(CARGO_LANE_STAGE_RADII)
+    ):
+        return None
+    route = _complete_route(position, core_position, blocked | danger_cells)
+    return worker if route.status == "SUCCESS" else None
+
+
+def _defender_heal_staging_exclusions(
+    memory: TacticMemory,
+    core_position: Position,
+) -> set[Position]:
+    exclusions = {
+        _next_position(core_position, direction)
+        for direction in CARDINAL_DIRECTIONS
+    }
+    lane = memory.cargo_lane
+    if lane.active:
+        exclusions.update(lane.path)
+        exclusions.update(lane.owner_approach_path)
+        exclusions.update(lane.heal_approach_path)
+        exclusions.update(lane.egress_path)
+        exclusions.update(lane.stage_targets.values())
+    return exclusions
+
+
+def _refresh_defender_heal_staging_target(
+    turn: Any,
+    core_position: Position | None,
+    blocked: set[Position],
+    danger_cells: set[Position],
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+) -> Position | None:
+    intent_id = memory.healing_defender_intent_id
+    if core_position is None or intent_id is None:
+        memory.healing_defender_stage_target = None
+        return None
+    defender = next(
+        (
+            unit
+            for unit in tuple(getattr(turn, "vanguards", ()))
+            + tuple(getattr(turn, "rangers", ()))
+            if str(getattr(unit, "id", "")) == intent_id
+        ),
+        None,
+    )
+    origin = _position(getattr(defender, "position", None))
+    if origin is None:
+        memory.healing_defender_stage_target = None
+        return None
+    exclusions = _defender_heal_staging_exclusions(memory, core_position)
+    route_blocked = set(blocked) | set(danger_cells) | exclusions
+    route_blocked.discard(origin)
+
+    def valid(target: Position | None) -> bool:
+        if target is None or target in route_blocked:
+            return False
+        if friendly_occupancy.get(target, 0) - int(target == origin) > 0:
+            return False
+        return _complete_route(origin, target, route_blocked).status == "SUCCESS"
+
+    if valid(memory.healing_defender_stage_target):
+        return memory.healing_defender_stage_target
+    candidates: list[tuple[int, int, int, Position]] = []
+    for target in _chebyshev_ring_positions(
+        core_position,
+        max(CARGO_LANE_STAGE_RADII),
+    ):
+        if not valid(target):
+            continue
+        route = _complete_route(origin, target, route_blocked)
+        candidates.append((len(route.path), target[0], target[1], target))
+    memory.healing_defender_stage_target = (
+        min(candidates)[3] if candidates else None
+    )
+    return memory.healing_defender_stage_target
+
+
+def _healing_priority_defender(
+    turn: Any,
+    core_position: Position | None,
+    blocked: set[Position],
+    danger_cells: set[Position],
+    memory: TacticMemory,
+) -> Any | None:
+    intent_id = memory.healing_defender_intent_id
+    if core_position is None or intent_id is None:
+        return None
+    defender = next(
+        (
+            unit
+            for unit in tuple(getattr(turn, "vanguards", ()))
+            + tuple(getattr(turn, "rangers", ()))
+            if str(getattr(unit, "id", "")) == intent_id
+        ),
+        None,
+    )
+    position = _position(getattr(defender, "position", None))
+    if defender is None or position is None:
+        return None
+    missing_hp = _unit_max_hp(defender.unit_type) - int(
+        getattr(defender, "hp", 0)
+    )
+    if (
+        missing_hp <= 0
+        or int(getattr(turn, "resources", 0))
+        < UNIT_HEAL_RESOURCE_RESERVE + missing_hp
+    ):
+        return None
+    if memory.healing_defender_admitted_id == intent_id:
+        return defender
+    near_idle_core = bool(
+        not memory.cargo_lane.active
+        and not any(
+            int(getattr(worker, "cargo", 0)) > 0
+            for worker in getattr(turn, "workers", ())
+        )
+        and _chebyshev(position, core_position)
+        <= max(CARGO_LANE_STAGE_RADII)
+    )
+    if not near_idle_core and (
+        memory.healing_defender_stage_target is None
+        or position != memory.healing_defender_stage_target
+        or _chebyshev(position, core_position) > max(CARGO_LANE_STAGE_RADII)
+    ):
+        return None
+    route = _complete_route(position, core_position, blocked | danger_cells)
+    return defender if route.status == "SUCCESS" else None
+
+
+def _refresh_healing_priority(
+    turn: Any,
+    core_position: Position | None,
+    blocked: set[Position],
+    danger_cells: set[Position],
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+) -> bool:
+    _refresh_defender_heal_staging_target(
+        turn,
+        core_position,
+        blocked,
+        danger_cells,
+        friendly_occupancy,
+        memory,
+    )
+    worker = _healing_priority_worker(
+        turn,
+        core_position,
+        blocked,
+        danger_cells,
+        memory,
+    )
+    defender = _healing_priority_defender(
+        turn,
+        core_position,
+        blocked,
+        danger_cells,
+        memory,
+    )
+    priority_candidates: list[tuple[int, int, str]] = []
+    if worker is not None:
+        priority_candidates.append(
+            (
+                memory.heal_intent_tick,
+                0,
+                str(getattr(worker, "id", "")),
+            )
+        )
+    if defender is not None:
+        priority_candidates.append(
+            (
+                memory.healing_defender_intent_tick,
+                1,
+                str(getattr(defender, "id", "")),
+            )
+        )
+    candidate_ids = {candidate[2] for candidate in priority_candidates}
+    intent_id = (
+        memory.heal_priority_intent_id
+        if memory.heal_priority_intent_id in candidate_ids
+        else min(priority_candidates)[2]
+        if priority_candidates
+        else None
+    )
+    if intent_id is None:
+        memory.heal_priority_intent_id = None
+        memory.core_visit_deposit_streak = 0
+        memory.core_visit_forced_purpose = None
+        return False
+    if memory.heal_priority_intent_id != intent_id:
+        memory.heal_priority_intent_id = intent_id
+        memory.core_visit_deposit_streak = 0
+        memory.core_visit_forced_purpose = None
+    if (
+        memory.healing_defender_admitted_id == intent_id
+        or memory.core_visit_deposit_streak >= HEAL_PRIORITY_DEPOSIT_LIMIT
+    ):
+        memory.core_visit_forced_purpose = "HEAL"
+    return True
+
+
+def _admit_healing_defender(
+    turn: Any,
+    core_position: Position | None,
+    blocked: set[Position],
+    memory: TacticMemory,
+    tick: int,
+) -> bool:
+    defender_id = memory.healing_defender_intent_id
+    if (
+        defender_id is None
+        or defender_id != memory.heal_priority_intent_id
+        or core_position is None
+        or memory.core_visit.unit_id is not None
+    ):
+        return False
+    defender = next(
+        (
+            unit
+            for unit in tuple(getattr(turn, "vanguards", ()))
+            + tuple(getattr(turn, "rangers", ()))
+            if str(getattr(unit, "id", "")) == defender_id
+        ),
+        None,
+    )
+    position = _position(getattr(defender, "position", None))
+    if defender is None or position is None:
+        return False
+    if memory.healing_defender_admitted_id != defender_id:
+        memory.healing_defender_admitted_id = defender_id
+        memory.healing_defender_admitted_tick = tick
+        route = _complete_route(position, core_position, blocked)
+        memory.healing_defender_best_distance = (
+            max(0, len(route.path) - 1)
+            if route.status == "SUCCESS"
+            else PATH_COST_UNREACHABLE
+        )
+        memory.healing_defender_last_progress_tick = tick
+        memory.healing_defender_last_position = position
+    memory.core_visit_forced_purpose = "HEAL"
+    return True
 
 
 def _refresh_cargo_lane_occupants(
@@ -3930,7 +4649,7 @@ def _refresh_cargo_lane_occupants(
     }
     owner = workers_by_id.get(lane.owner_id or "")
     owner_position = _position(getattr(owner, "position", None))
-    owner_approach_positions: set[Position] = set()
+    owner_approach_path: tuple[Position, ...] = ()
     if (
         lane.phase in {"INBOUND", "DEPOSIT"}
         and owner_position is not None
@@ -3943,10 +4662,37 @@ def _refresh_cargo_lane_occupants(
             blocked | danger_cells,
         )
         if owner_route.status == "SUCCESS":
-            owner_approach_positions.update(
+            owner_approach_path = tuple(
                 owner_route.path[-(CARGO_LANE_GATEWAY_STEPS + 1) :]
             )
-    staging_exclusions = lane_positions | owner_approach_positions
+    lane.owner_approach_path = owner_approach_path
+    owner_approach_positions = set(owner_approach_path)
+    admitted_defender = next(
+        (
+            unit
+            for unit in tuple(getattr(turn, "vanguards", ()))
+            + tuple(getattr(turn, "rangers", ()))
+            if str(getattr(unit, "id", ""))
+            == memory.healing_defender_admitted_id
+        ),
+        None,
+    )
+    admitted_position = _position(getattr(admitted_defender, "position", None))
+    heal_approach_path: tuple[Position, ...] = ()
+    if admitted_position is not None:
+        heal_route = _complete_route(
+            admitted_position,
+            lane.core_position,
+            blocked | danger_cells,
+        )
+        if heal_route.status == "SUCCESS":
+            heal_approach_path = tuple(heal_route.path)
+    lane.heal_approach_path = heal_approach_path
+    staging_exclusions = (
+        lane_positions
+        | owner_approach_positions
+        | set(heal_approach_path)
+    )
     queued_owner = workers_by_id.get(lane.queued_owner_id or "")
     queued_owner_has_cargo = bool(
         queued_owner is not None and int(getattr(queued_owner, "cargo", 0)) > 0
@@ -3976,6 +4722,20 @@ def _refresh_cargo_lane_occupants(
         and not (
             str(getattr(worker, "id", "")) == lane.queued_owner_id
             and _position(getattr(worker, "position", None)) == lane.gateway
+            and memory.healing_defender_admitted_id is None
+        )
+    }
+    lane.yield_unit_ids = {
+        str(getattr(unit, "id", ""))
+        for unit in getattr(turn, "units", ())
+        if _enum_label(getattr(unit, "unit_type", ""))
+        in {"VANGUARD", "RANGER"}
+        and _position(getattr(unit, "position", None)) in staging_exclusions
+        and str(getattr(unit, "id", ""))
+        != memory.healing_defender_admitted_id
+        and not (
+            memory.core_visit.purpose == "HEAL"
+            and str(getattr(unit, "id", "")) == memory.core_visit.unit_id
         )
     }
     staged_cargo = [
@@ -4048,6 +4808,17 @@ def _update_cargo_lane(
     ]
     cargo_ids = {str(getattr(worker, "id", "")) for worker in cargo_workers}
     lane = memory.cargo_lane
+    healing_priority_ready = _refresh_healing_priority(
+        turn,
+        core_position,
+        blocked,
+        danger_cells,
+        friendly_occupancy,
+        memory,
+    )
+    # Lane geometry is refreshed only at an idle handoff boundary. Replacing
+    # an active path mid-INBOUND/EGRESS would invalidate the half-duplex
+    # reservations of the worker already in the corridor.
     waiting_cargo_ids = {
         worker_id
         for worker_id, stage_target in lane.stage_targets.items()
@@ -4076,7 +4847,23 @@ def _update_cargo_lane(
         return memory.cargo_lane
 
     if not lane.active:
+        if healing_priority_ready and (
+            memory.core_visit_forced_purpose == "HEAL" or not cargo_workers
+        ):
+            if _admit_healing_defender(
+                turn,
+                core_position,
+                blocked | danger_cells,
+                memory,
+                tick,
+            ):
+                return lane
         if not core_accepts_delivery:
+            return lane
+        if (
+            healing_priority_ready
+            and memory.core_visit_forced_purpose == "HEAL"
+        ):
             return lane
         single_path = _single_open_cargo_lane_path(
             core_position,
@@ -4128,14 +4915,20 @@ def _update_cargo_lane(
             gateway=bridge.gateway,
             startup_pending_ids=startup_pending_ids,
             started_tick=tick,
+            phase_started_tick=tick,
             last_planned_tick=tick,
+            geometry_source=(
+                "SINGLE_OPEN"
+                if single_path is not None
+                else "CORE_POCKET"
+            ),
         )
         memory.cargo_lane = lane
         if lane.owner_id is not None:
             memory.cargo_lane_wait_ticks.pop(lane.owner_id, None)
         lane.startup_pending_ids.discard(owner_id or "")
         if lane.startup_pending_ids:
-            lane.phase = "STARTUP_EVACUATION"
+            _set_cargo_lane_phase(lane, "STARTUP_EVACUATION", tick)
             lane.queued_owner_id = owner_id
             lane.owner_id = None
             _select_cargo_lane_departing_worker(
@@ -4143,6 +4936,22 @@ def _update_cargo_lane(
                 workers_by_id,
                 blocked | danger_cells,
                 friendly_occupancy,
+                tick,
+            )
+
+    if memory.core_visit.unit_id is None:
+        if not healing_priority_ready:
+            memory.core_visit_forced_purpose = None
+        deposit_worker = workers_by_id.get(memory.cargo_lane.owner_id or "")
+        if (
+            deposit_worker is not None
+            and _position(getattr(deposit_worker, "position", None)) == core_position
+            and int(getattr(deposit_worker, "cargo", 0)) > 0
+        ):
+            memory.core_visit = CoreVisit(
+                unit_id=str(getattr(deposit_worker, "id", "")),
+                purpose="DEPOSIT",
+                granted_tick=tick,
             )
 
     lane = memory.cargo_lane
@@ -4173,6 +4982,9 @@ def _update_cargo_lane(
         lane.departing_worker_id = None
         lane.egress_path = ()
         lane.egress_target = None
+        _reset_cargo_lane_departing_progress(lane)
+        if lane.phase == "EGRESS":
+            lane.phase_started_tick = tick
     elif (
         departing_position is not None
         and _cargo_lane_egress_complete(
@@ -4186,20 +4998,52 @@ def _update_cargo_lane(
         lane.departing_worker_id = None
         lane.egress_path = ()
         lane.egress_target = None
+        _reset_cargo_lane_departing_progress(lane)
+        if lane.phase == "EGRESS":
+            lane.phase_started_tick = tick
 
     owner = workers_by_id.get(lane.owner_id or "")
     owner_position = _position(getattr(owner, "position", None))
     owner_has_cargo = owner is not None and int(getattr(owner, "cargo", 0)) > 0
+    stalled_inbound_owner_id: str | None = None
     if owner is not None and not owner_has_cargo:
         departing_id = str(getattr(owner, "id", ""))
         lane.departing_worker_id = departing_id
         lane.owner_id = None
-        lane.phase = "EGRESS"
+        _set_cargo_lane_phase(lane, "EGRESS", tick)
         lane.egress_path = ()
         lane.egress_target = None
+        lane.owner_approach_path = ()
+        _reset_cargo_lane_owner_progress(lane, tick)
+        _reset_cargo_lane_departing_progress(lane, tick)
         owner = None
     elif lane.owner_id is not None and owner is None:
         lane.owner_id = None
+        lane.owner_approach_path = ()
+        _reset_cargo_lane_owner_progress(lane, tick)
+    elif _cargo_lane_owner_stalled(
+        lane,
+        owner_position,
+        blocked | danger_cells,
+        tick,
+    ):
+        lane.watchdog_tick = tick
+        if owner_position in lane.path:
+            lane.watchdog_reason = "INBOUND_OWNER_STALLED_IN_LANE"
+            _reset_cargo_lane_owner_progress(lane, tick)
+        else:
+            # An owner outside the physical corridor can be replaced safely.
+            # Once it enters lane.path, preserving half-duplex ownership takes
+            # precedence over watchdog recovery.
+            stalled_inbound_owner_id = lane.owner_id
+            lane.watchdog_reason = "INBOUND_OWNER_STALLED"
+            lane.owner_id = None
+            lane.owner_approach_path = ()
+            lane.phase_started_tick = tick
+            _reset_cargo_lane_owner_progress(lane, tick)
+            owner = None
+            owner_position = None
+            owner_has_cargo = False
 
     if lane.departing_worker_id is not None:
         departing = workers_by_id.get(lane.departing_worker_id)
@@ -4219,20 +5063,59 @@ def _update_cargo_lane(
                 lane.egress_path = route
                 lane.egress_target = route[-1]
 
+        if _cargo_lane_departing_stalled(lane, departing_position, tick):
+            route = _cargo_lane_egress_route(
+                departing_position,
+                lane,
+                blocked | danger_cells,
+                friendly_occupancy,
+            )
+            if route is not None:
+                lane.egress_path = route
+                lane.egress_target = route[-1]
+            lane.watchdog_tick = tick
+            lane.watchdog_reason = "EGRESS_DEPARTING_STALLED"
+            _reset_cargo_lane_departing_progress(lane, tick)
+
     if lane.startup_pending_ids and lane.departing_worker_id is None:
         _select_cargo_lane_departing_worker(
             lane,
             workers_by_id,
             blocked | danger_cells,
             friendly_occupancy,
+            tick,
         )
 
+    # A simple open-entrance lane may have become stale while cargo was
+    # queued, but changing geometry is safe only after the previous worker has
+    # fully left the lane. Never replace a locally-built Core-pocket bridge.
+    if (
+        lane.owner_id is None
+        and lane.departing_worker_id is None
+        and not lane.startup_pending_ids
+        and lane.phase in {"EGRESS", "STARTUP_EVACUATION"}
+        and lane.geometry_source == "SINGLE_OPEN"
+    ):
+        refreshed_path = _single_open_cargo_lane_path(
+            core_position,
+            blocked | danger_cells,
+            friendly_occupancy,
+        )
+        if refreshed_path is not None:
+            lane.path = refreshed_path
+            lane.gateway = refreshed_path[-1]
+            lane.last_planned_tick = tick
+            lane.egress_path = ()
+            lane.egress_target = None
+
     if lane.departing_worker_id is not None or lane.startup_pending_ids:
-        lane.phase = (
-            "STARTUP_EVACUATION" if lane.startup_pending_ids else "EGRESS"
+        _set_cargo_lane_phase(
+            lane,
+            "STARTUP_EVACUATION" if lane.startup_pending_ids else "EGRESS",
+            tick,
         )
         lane.owner_id = None
-    elif lane.owner_id is None and cargo_workers and core_accepts_delivery:
+    else:
         queued_owner = workers_by_id.get(lane.queued_owner_id or "")
         queued_position = _position(getattr(queued_owner, "position", None))
         queued_route = (
@@ -4240,28 +5123,76 @@ def _update_cargo_lane(
             if queued_position is not None and lane.gateway is not None
             else None
         )
-        if (
-            queued_owner is None
-            or int(getattr(queued_owner, "cargo", 0)) <= 0
-            or queued_route is None
-            or queued_route.status != "SUCCESS"
-        ):
-            queued_owner, queued_route = _select_cargo_lane_owner(
-                cargo_workers,
-                lane.gateway,
-                blocked,
-                memory,
-                onward_steps=max(0, len(lane.path) - 1),
-            )
-        lane.owner_id = (
-            str(getattr(queued_owner, "id", ""))
-            if queued_owner is not None
-            else None
+        queued_owner_valid = bool(
+            queued_owner is not None
+            and int(getattr(queued_owner, "cargo", 0)) > 0
+            and queued_route is not None
+            and queued_route.status == "SUCCESS"
         )
-        if lane.owner_id is not None:
-            memory.cargo_lane_wait_ticks.pop(lane.owner_id, None)
-        lane.queued_owner_id = None
-        lane.phase = "INBOUND"
+        safe_heal_handoff = bool(
+            lane.owner_id is None
+            and lane.departing_worker_id is None
+            and not lane.startup_pending_ids
+            and memory.core_visit.unit_id is None
+        )
+        if (
+            safe_heal_handoff
+            and stalled_inbound_owner_id is None
+            and healing_priority_ready
+            and memory.core_visit_forced_purpose == "HEAL"
+        ):
+            _admit_healing_defender(
+                turn,
+                core_position,
+                blocked | danger_cells,
+                memory,
+                tick,
+            )
+        if (
+            lane.phase == "EGRESS"
+            and queued_owner_valid
+            and memory.core_visit.unit_id is None
+            and memory.core_visit_forced_purpose == "HEAL"
+            and memory.healing_defender_admitted_id is None
+            and tick - lane.phase_started_tick
+            >= CARGO_LANE_EGRESS_WATCHDOG_TICKS
+        ):
+            memory.core_visit_forced_purpose = None
+            memory.core_visit_deposit_streak = 0
+            lane.watchdog_tick = tick
+            lane.watchdog_reason = "EGRESS_HANDOFF_TIMEOUT"
+        if (
+            lane.owner_id is None
+            and cargo_workers
+            and core_accepts_delivery
+            and (
+                memory.core_visit_forced_purpose != "HEAL"
+                or stalled_inbound_owner_id is not None
+            )
+        ):
+            if not queued_owner_valid:
+                queued_owner, queued_route = _select_cargo_lane_owner(
+                    (
+                        worker
+                        for worker in cargo_workers
+                        if str(getattr(worker, "id", ""))
+                        != stalled_inbound_owner_id
+                    ),
+                    lane.gateway,
+                    blocked,
+                    memory,
+                    onward_steps=max(0, len(lane.path) - 1),
+                )
+            lane.owner_id = (
+                str(getattr(queued_owner, "id", ""))
+                if queued_owner is not None
+                else None
+            )
+            if lane.owner_id is not None:
+                memory.cargo_lane_wait_ticks.pop(lane.owner_id, None)
+            lane.queued_owner_id = None
+            _set_cargo_lane_phase(lane, "INBOUND", tick)
+            _reset_cargo_lane_owner_progress(lane, tick)
 
     queued_owner = workers_by_id.get(lane.queued_owner_id or "")
     queued_position = _position(getattr(queued_owner, "position", None))
@@ -4324,7 +5255,7 @@ def _update_cargo_lane(
         )
 
     if active_owner_position == core_position:
-        lane.phase = "DEPOSIT"
+        _set_cargo_lane_phase(lane, "DEPOSIT", tick)
 
     if (
         not cargo_workers
@@ -4358,9 +5289,34 @@ def _queue_worker_route(
     if origin is None or target is None or origin == target:
         return False, "AT_TARGET", None
     route_blocked = set(blocked)
+    healing_access = role == "HEAL" and (
+        memory.heal_intent_id == worker_id
+        or (
+            memory.core_visit.unit_id == worker_id
+            and memory.core_visit.purpose == "HEAL"
+        )
+    ) and (
+        not memory.cargo_lane.active
+        or (
+            memory.cargo_lane.owner_id is None
+            and memory.cargo_lane.departing_worker_id is None
+            and not memory.cargo_lane.startup_pending_ids
+        )
+    )
+    capacity_reservations = reservations
+    if healing_access and reservations:
+        if isinstance(reservations, dict):
+            capacity_reservations = {
+                position: count
+                for position, count in reservations.items()
+                if position != target
+            }
+        else:
+            capacity_reservations = set(reservations)
+            capacity_reservations.discard(target)
     capacity_blocked = _unit_capacity_blocked(
         friendly_occupancy,
-        reservations,
+        capacity_reservations,
         actor_origin=origin,
     )
     if memory.cargo_lane.active and worker_id not in {
@@ -4371,9 +5327,10 @@ def _queue_worker_route(
         gateway_was_available = bool(
             gateway is not None and gateway not in capacity_blocked
         )
-        capacity_blocked.update(memory.cargo_lane.path)
-        capacity_blocked.update(memory.cargo_lane.egress_path)
-        if memory.cargo_lane.core_position is not None:
+        if not healing_access:
+            capacity_blocked.update(memory.cargo_lane.path)
+            capacity_blocked.update(memory.cargo_lane.egress_path)
+        if memory.cargo_lane.core_position is not None and not healing_access:
             capacity_blocked.update(
                 _next_position(memory.cargo_lane.core_position, direction)
                 for direction in CARDINAL_DIRECTIONS
@@ -4740,59 +5697,173 @@ def _queue_critical_combat_escape(
     return True
 
 
-def _register_critical_healing(
-    turn: Any,
-    unit: Any,
+def _clear_defender_heal_admission(
     memory: TacticMemory,
-    core_position: Position | None,
+    *,
+    clear_intent: bool,
 ) -> None:
-    if core_position is None or not _is_critical_combat_unit(unit):
-        return
-    missing_hp = _unit_max_hp(unit.unit_type) - int(getattr(unit, "hp", 0))
-    if int(getattr(turn, "resources", 0)) >= UNIT_HEAL_RESOURCE_RESERVE + missing_hp:
-        memory.healing_defender_ids.add(str(getattr(unit, "id", "")))
+    admitted_id = memory.healing_defender_admitted_id
+    memory.healing_defender_admitted_id = None
+    memory.healing_defender_admitted_tick = -1
+    memory.healing_defender_best_distance = None
+    memory.healing_defender_last_progress_tick = -1
+    memory.healing_defender_last_position = None
+    memory.cargo_lane.heal_approach_path = ()
+    if clear_intent:
+        if memory.heal_priority_intent_id in {
+            admitted_id,
+            memory.healing_defender_intent_id,
+        }:
+            memory.heal_priority_intent_id = None
+            memory.core_visit_forced_purpose = None
+            memory.core_visit_deposit_streak = 0
+        memory.healing_defender_intent_id = None
+        memory.healing_defender_intent_tick = -1
+        memory.healing_defender_stage_target = None
 
 
 def _refresh_healing_defenders(
     turn: Any,
     memory: TacticMemory,
     core_position: Position | None,
+    blocked: set[Position],
 ) -> None:
+    tick = int(getattr(turn, "tick", 0))
     defenders = tuple(getattr(turn, "vanguards", ())) + tuple(
         getattr(turn, "rangers", ())
     )
     defenders_by_id = {
         str(getattr(defender, "id", "")): defender for defender in defenders
     }
-    memory.healing_defender_ids.intersection_update(defenders_by_id)
-    for defender_id in tuple(memory.healing_defender_ids):
-        defender = defenders_by_id[defender_id]
-        if int(getattr(defender, "hp", 0)) >= _unit_max_hp(defender.unit_type):
-            memory.healing_defender_ids.discard(defender_id)
-    if memory.healing_defender_ids or core_position is None:
-        return
-
     type_counts = {
         unit_type: sum(defender.unit_type == unit_type for defender in defenders)
         for unit_type in (UnitType.VANGUARD, UnitType.RANGER)
     }
     candidates: list[tuple[float, int, str]] = []
-    for defender in defenders:
-        max_hp = _unit_max_hp(defender.unit_type)
-        missing_hp = max_hp - int(getattr(defender, "hp", max_hp))
-        if missing_hp <= 0 or type_counts[defender.unit_type] <= 1:
-            continue
-        if int(getattr(turn, "resources", 0)) < UNIT_HEAL_RESOURCE_RESERVE + missing_hp:
-            continue
-        candidates.append(
-            (
-                int(getattr(defender, "hp", 0)) / max_hp,
-                _manhattan(_position(defender.position), core_position),
-                str(defender.id),
+    if core_position is not None:
+        for defender in defenders:
+            defender_id = str(getattr(defender, "id", ""))
+            position = _position(getattr(defender, "position", None))
+            max_hp = _unit_max_hp(defender.unit_type)
+            missing_hp = max_hp - int(getattr(defender, "hp", max_hp))
+            if (
+                not defender_id
+                or position is None
+                or missing_hp <= 0
+                or type_counts[defender.unit_type] <= 1
+                or memory.healing_defender_cooldowns.get(defender_id, 0) > tick
+            ):
+                continue
+            if (
+                int(getattr(turn, "resources", 0))
+                < UNIT_HEAL_RESOURCE_RESERVE + missing_hp
+            ):
+                continue
+            candidates.append(
+                (
+                    int(getattr(defender, "hp", 0)) / max_hp,
+                    _manhattan(position, core_position),
+                    defender_id,
+                )
             )
+    candidate_ids = {candidate[2] for candidate in candidates}
+    memory.healing_defender_ids = candidate_ids
+
+    if memory.healing_defender_intent_id not in candidate_ids:
+        _clear_defender_heal_admission(memory, clear_intent=True)
+    if memory.healing_defender_intent_id is None and candidates:
+        memory.healing_defender_intent_id = min(candidates)[2]
+        memory.healing_defender_intent_tick = tick
+        memory.healing_defender_stage_target = None
+
+    admitted_id = memory.healing_defender_admitted_id
+    admitted = defenders_by_id.get(admitted_id or "")
+    admitted_position = _position(getattr(admitted, "position", None))
+    if admitted_id is None or admitted_position is None or core_position is None:
+        return
+    admitted_route = _complete_route(admitted_position, core_position, blocked)
+    admitted_distance = (
+        max(0, len(admitted_route.path) - 1)
+        if admitted_route.status == "SUCCESS"
+        else PATH_COST_UNREACHABLE
+    )
+    if (
+        memory.healing_defender_best_distance is None
+        or admitted_distance < memory.healing_defender_best_distance
+    ):
+        memory.healing_defender_best_distance = admitted_distance
+        memory.healing_defender_last_progress_tick = tick
+    memory.healing_defender_last_position = admitted_position
+    if (
+        admitted_position != core_position
+        and memory.healing_defender_last_progress_tick >= 0
+        and tick - memory.healing_defender_last_progress_tick
+        >= DEFENDER_HEAL_ADMISSION_TIMEOUT_TICKS
+    ):
+        memory.healing_defender_cooldowns[admitted_id] = (
+            tick + DEFENDER_HEAL_COOLDOWN_TICKS
         )
-    if candidates:
-        memory.healing_defender_ids.add(min(candidates)[2])
+        _clear_defender_heal_admission(memory, clear_intent=True)
+
+
+def _refresh_healing_workers(
+    turn: Any,
+    memory: TacticMemory,
+    core_position: Position | None,
+) -> None:
+    workers = tuple(getattr(turn, "workers", ()))
+    workers_by_id = {
+        str(getattr(worker, "id", "")): worker for worker in workers
+    }
+    memory.healing_worker_ids.intersection_update(workers_by_id)
+    for worker_id in tuple(memory.healing_worker_ids):
+        worker = workers_by_id[worker_id]
+        if (
+            int(getattr(worker, "cargo", 0)) > 0
+            or int(getattr(worker, "hp", 0)) >= _unit_max_hp(UnitType.WORKER)
+        ):
+            memory.healing_worker_ids.discard(worker_id)
+            if memory.heal_intent_id == worker_id:
+                memory.heal_intent_id = None
+                memory.heal_intent_tick = -1
+                memory.heal_intent_best_distance = None
+    if core_position is None:
+        return
+    candidates = []
+    intent_candidates = []
+    for worker in workers:
+        missing_hp = _unit_max_hp(UnitType.WORKER) - int(getattr(worker, "hp", 0))
+        worker_id = str(getattr(worker, "id", ""))
+        if (
+            missing_hp <= 0
+            or int(getattr(worker, "cargo", 0)) > 0
+            or worker_id in {memory.cargo_lane.owner_id, memory.cargo_lane.departing_worker_id}
+            or int(getattr(turn, "resources", 0)) < UNIT_HEAL_RESOURCE_RESERVE + missing_hp
+        ):
+            continue
+        position = _position(getattr(worker, "position", None))
+        if position is None:
+            continue
+        candidate = (
+            int(getattr(worker, "hp", 0)) / _unit_max_hp(UnitType.WORKER),
+            _manhattan(position, core_position),
+            worker_id,
+        )
+        candidates.append(candidate)
+        if memory.heal_intent_cooldowns.get(worker_id, 0) <= int(
+            getattr(turn, "tick", 0)
+        ):
+            intent_candidates.append(candidate)
+    memory.healing_worker_ids = {candidate[2] for candidate in candidates}
+    if memory.heal_intent_id not in memory.healing_worker_ids:
+        memory.heal_intent_id = None
+        memory.heal_intent_tick = -1
+        memory.heal_intent_best_distance = None
+    if memory.heal_intent_id is None and intent_candidates:
+        selected = min(intent_candidates)
+        memory.heal_intent_id = selected[2]
+        memory.heal_intent_tick = int(getattr(turn, "tick", 0))
+        memory.heal_intent_best_distance = selected[1]
 
 
 def _adjacent_direction(origin: Position, target: Position) -> Direction | None:
@@ -5754,6 +6825,18 @@ def _resource_assignments(
         (worker, _position(getattr(worker, "position", None)))
         for worker in workers
         if int(getattr(worker, "cargo", 0)) <= 0
+        and int(getattr(worker, "hp", 0)) > 1
+        and str(getattr(worker, "id", "")) not in memory.scout_return_hold_ids
+        and (
+            str(getattr(worker, "id", "")) not in memory.scout_return_targets
+            or (
+                _position(getattr(worker, "position", None)) is not None
+                and _manhattan(
+                    _position(getattr(worker, "position", None)),
+                    memory.scout_return_targets[str(getattr(worker, "id", ""))],
+                ) <= CARGO_LANE_STAGE_RADII[-1]
+            )
+        )
         and _position(getattr(worker, "position", None)) is not None
     ]
     if not candidates or not eligible_workers:
@@ -5967,6 +7050,44 @@ def _queue_cargo_lane_egress_step(
     return True
 
 
+def _queue_cargo_lane_defender_yield(
+    unit: Any,
+    lane: CargoLanePlan,
+    blocked: set[Position],
+    reservations: Any,
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+    tick: int,
+) -> bool:
+    origin = _position(getattr(unit, "position", None))
+    unit_id = str(getattr(unit, "id", ""))
+    if (
+        origin is None
+        or not unit_id
+        or unit_id not in lane.yield_unit_ids
+        or lane.core_position is None
+    ):
+        return False
+    direction = _cargo_lane_yield_direction(
+        origin,
+        lane.core_position,
+        set(lane.path)
+        | set(lane.owner_approach_path)
+        | set(lane.heal_approach_path)
+        | set(lane.egress_path),
+        blocked,
+        reservations,
+        friendly_occupancy,
+    )
+    if direction is None:
+        return False
+    destination = _next_position(origin, direction)
+    _reserve_destination(reservations, destination)
+    memory.note_unit_move(unit_id, destination, destination, None)
+    unit.move(direction)
+    return True
+
+
 def _update_core_lane_clearance(
     workers: list[Any],
     core_position: Position | None,
@@ -6013,6 +7134,7 @@ def _update_core_lane_clearance(
                 for worker in workers
                 if int(getattr(worker, "cargo", 0)) == 0
                 and _position(getattr(worker, "position", None)) == core_position
+                and str(getattr(worker, "id", "")) != memory.heal_intent_id
             ),
             key=lambda worker: str(getattr(worker, "id", "")),
         )
@@ -6099,19 +7221,17 @@ def _plan_workers(
 
         previous_target = memory.resource_intents.get(worker_key)
         if previous_target is None:
-            continue
-        if (
+            pass
+        elif (
             previous_target not in available_resources
             or memory.resource_is_cooling_down(previous_target, tick)
         ):
             memory.clear_resource_intent(worker_key)
-            continue
-        if worker_position == previous_target:
+        elif worker_position == previous_target:
             if previous_target not in current_resources:
                 memory.forget_resource(previous_target)
                 memory.clear_resource_intent(worker_key)
-            continue
-        if worker_position is not None:
+        elif worker_position is not None:
             route_cost = _estimated_path_cost(
                 worker_position,
                 previous_target,
@@ -6127,13 +7247,13 @@ def _plan_workers(
                 )
                 memory.forget_resource(previous_target)
                 memory.clear_resource_intent(worker_key)
-                continue
-            memory.note_resource_progress(
-                worker_key,
-                previous_target,
-                route_cost,
-                tick,
-            )
+            else:
+                memory.note_resource_progress(
+                    worker_key,
+                    previous_target,
+                    route_cost,
+                    tick,
+                )
 
     # A depleted remembered target may have been removed during the pass above.
     remembered_resources = memory.recent_resource_targets(tick, resource_memory_ttl)
@@ -6195,6 +7315,16 @@ def _plan_workers(
         worker_key = str(getattr(worker, "id", ""))
         worker_slot = worker_slots[worker_key]
         contested_positions = memory.contested_worker_positions(worker_key, tick)
+        injured_far_from_core = bool(
+            cargo == 0
+            and core_position is not None
+            and worker_position is not None
+            and int(getattr(worker, "hp", 0)) < _unit_max_hp(UnitType.WORKER)
+            and _manhattan(worker_position, core_position)
+            > SCOUT_INJURED_MAX_DISTANCE
+        )
+        if injured_far_from_core:
+            memory.begin_scout_return(worker_key, core_position)
 
         if worker_position is not None and combat_enemies:
             nearest_enemy_distance = min(
@@ -6205,7 +7335,12 @@ def _plan_workers(
                 )
                 if enemy_position is not None
             )
-            if nearest_enemy_distance <= WORKER_EVADE_DISTANCE:
+            projected_damage = _projected_incoming_damage(
+                worker_position,
+                combat_enemies,
+                obstacles,
+            )
+            if nearest_enemy_distance <= WORKER_EVADE_DISTANCE or projected_damage > 0:
                 if (
                     core_position is not None
                     and worker_position is not None
@@ -6255,6 +7390,20 @@ def _plan_workers(
                         continue
                 worker.wait()
                 continue
+
+        if injured_far_from_core:
+            moved, _, _ = _queue_worker_route(
+                worker,
+                core_position,
+                "INJURED_RETURN",
+                worker_return_blocked | contested_positions,
+                reserved_destinations,
+                friendly_occupancy,
+                memory,
+            )
+            if not moved:
+                worker.wait()
+            continue
 
         lane = memory.cargo_lane
         if (
@@ -6381,7 +7530,21 @@ def _plan_workers(
         if cargo > 0:
             recovery = memory.cargo_recovery.setdefault(worker_key, CargoRecovery())
             if core_accepts_delivery and worker_position == core_position:
-                if delivery_space > 0:
+                # The worker already occupying the Core cell must be allowed to
+                # finish its operation. A remote HEAL intent is only an entry
+                # reservation and cannot veto this deposit.
+                physical_visit_blocked = (
+                    memory.core_visit.unit_id is not None
+                    and memory.core_visit.unit_id != worker_key
+                    and (
+                        memory.core_visit.purpose != "HEAL"
+                        or memory.core_visit.reached_core
+                    )
+                )
+                if physical_visit_blocked:
+                    worker.wait()
+                elif delivery_space > 0:
+                    memory.core_visit = CoreVisit(worker_key, "DEPOSIT", tick)
                     worker.deposit()
                     delivered = min(cargo, delivery_space)
                     pending_delivery += delivered
@@ -6501,11 +7664,116 @@ def _plan_workers(
                     worker.wait()
                 continue
 
+        if (
+            cargo == 0
+            and int(getattr(worker, "hp", 0)) <= 1
+            and core_position is not None
+            and worker_position is not None
+            and _manhattan(worker_position, core_position) > 3
+        ):
+            memory.begin_scout_return(worker_key, core_position)
+
+        # A critical Worker may be held at the outer staging ring by the
+        # return-state machine. HEAL intent reserves entry priority, but does
+        # not own the physical Core slot until the Worker reaches that cell.
+        if (
+            worker_key == memory.heal_intent_id
+            and core_position is not None
+            and memory.core_visit_forced_purpose != "DEPOSIT"
+        ):
+            if worker_position == core_position:
+                if memory.core_visit.unit_id in {None, worker_key}:
+                    memory.core_visit = CoreVisit(
+                        worker_key, "HEAL", tick, reached_core=True
+                    )
+                    worker.heal()
+                else:
+                    worker.wait()
+            else:
+                moved, _, _ = _queue_worker_route(
+                    worker,
+                    core_position,
+                    "HEAL",
+                    worker_return_blocked,
+                    reserved_destinations,
+                    friendly_occupancy,
+                    memory,
+                )
+                if not moved:
+                    worker.wait()
+            continue
+
+        target = assignments.get(worker_key)
         return_target = memory.scout_return_targets.get(worker_key)
+        local_return_resource = (
+            target is not None
+            and return_target is not None
+            and worker_position is not None
+            and _manhattan(worker_position, return_target) <= CARGO_LANE_STAGE_RADII[-1]
+        )
+        if local_return_resource:
+            route_cost = _estimated_path_cost(worker_position, target, blocked)
+            memory.set_resource_intent(worker_key, target, route_cost)
+            if worker_position == target:
+                if target in current_resources:
+                    worker.harvest()
+                    memory.clear_resource_intent(worker_key)
+                    continue
+                memory.forget_resource(target)
+                memory.clear_resource_intent(worker_key)
+            else:
+                moved, _, _ = _queue_worker_route(
+                    worker,
+                    target,
+                    "RESOURCE",
+                    worker_blocked,
+                    reserved_destinations,
+                    friendly_occupancy,
+                    memory,
+                )
+                if moved:
+                    continue
+
         if return_target is not None and worker_position is not None:
-            if _manhattan(worker_position, return_target) <= 3:
+            route_cost = _estimated_path_cost(
+                worker_position,
+                return_target,
+                worker_return_blocked,
+            )
+            at_safe_staging = (
+                core_position is not None
+                and _chebyshev(
+                    worker_position,
+                    return_target,
+                ) == CARGO_LANE_STAGE_RADII[-1]
+                and _complete_route(
+                    worker_position,
+                    return_target,
+                    worker_return_blocked,
+                ).status
+                == "SUCCESS"
+            )
+            if _manhattan(worker_position, return_target) <= 3 or at_safe_staging:
+                if int(getattr(worker, "hp", 0)) <= 1:
+                    memory.release_scout_return(worker_key, tick, hold=True)
+                    worker.wait()
+                    continue
                 memory.clear_scout_return(worker_key, tick)
             else:
+                stalled = memory.note_scout_return_progress(
+                    worker_key,
+                    return_target,
+                    route_cost,
+                    tick,
+                )
+                if stalled:
+                    memory.release_scout_return(
+                        worker_key,
+                        tick,
+                        hold=int(getattr(worker, "hp", 0)) <= 1,
+                    )
+                    worker.wait()
+                    continue
                 moved, _, _ = _queue_worker_route(
                     worker,
                     return_target,
@@ -6519,6 +7787,59 @@ def _plan_workers(
                     continue
                 worker.wait()
                 continue
+
+        if worker_key in memory.scout_return_hold_ids:
+            if worker_key == memory.heal_intent_id and core_position is not None:
+                if worker_position == core_position:
+                    if memory.core_visit.unit_id in {None, worker_key}:
+                        memory.core_visit = CoreVisit(
+                            worker_key, "HEAL", tick, reached_core=True
+                        )
+                        worker.heal()
+                    else:
+                        worker.wait()
+                else:
+                    moved, _, _ = _queue_worker_route(
+                        worker,
+                        core_position,
+                        "HEAL",
+                        worker_return_blocked,
+                        reserved_destinations,
+                        friendly_occupancy,
+                        memory,
+                    )
+                    if not moved:
+                        worker.wait()
+            else:
+                worker.wait()
+            continue
+
+        if (
+            worker_key == memory.heal_intent_id
+            and core_position is not None
+            and memory.core_visit_forced_purpose != "DEPOSIT"
+        ):
+            if worker_position == core_position:
+                if memory.core_visit.unit_id in {None, worker_key}:
+                    memory.core_visit = CoreVisit(
+                        worker_key, "HEAL", tick, reached_core=True
+                    )
+                    worker.heal()
+                else:
+                    worker.wait()
+            else:
+                moved, _, _ = _queue_worker_route(
+                    worker,
+                    core_position,
+                    "HEAL",
+                    worker_return_blocked,
+                    reserved_destinations,
+                    friendly_occupancy,
+                    memory,
+                )
+                if not moved:
+                    worker.wait()
+            continue
 
         if (
             memory.raid.observer_id == worker_key
@@ -6631,10 +7952,18 @@ def _plan_workers(
             if worker_position == exploration_target:
                 memory.advance_exploration(worker.id, worker_slot)
                 continue
+            if (
+                int(getattr(worker, "hp", 0)) < _unit_max_hp(UnitType.WORKER)
+                and _manhattan(worker_position, exploration_target)
+                > SCOUT_INJURED_MAX_DISTANCE
+            ):
+                memory.advance_exploration(worker.id, worker_slot, rotate=True)
+                continue
+            scout_blocked = worker_blocked | memory.recent_worker_return_danger(tick)
             route_cost = _estimated_path_cost(
                 worker_position,
                 exploration_target,
-                worker_blocked,
+                scout_blocked,
             )
             if route_cost >= PATH_COST_UNREACHABLE:
                 memory.advance_exploration(
@@ -6659,7 +7988,7 @@ def _plan_workers(
                 worker,
                 exploration_target,
                 "SCOUT",
-                worker_blocked,
+                scout_blocked,
                 reserved_destinations,
                 friendly_occupancy,
                 memory,
@@ -6707,6 +8036,94 @@ def _plan_workers(
     return pending_delivery
 
 
+def _queue_healing_defender_action(
+    unit: Any,
+    core_position: Position | None,
+    movement_blocked: set[Position],
+    reserved_destinations: Any,
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+    tick: int,
+) -> bool:
+    unit_id = str(getattr(unit, "id", ""))
+    origin = _position(getattr(unit, "position", None))
+    if (
+        not unit_id
+        or origin is None
+        or core_position is None
+        or unit_id
+        not in {
+            memory.healing_defender_intent_id,
+            memory.healing_defender_admitted_id,
+        }
+    ):
+        return False
+    if unit_id == memory.healing_defender_admitted_id:
+        if origin == core_position:
+            if memory.core_visit.unit_id in {None, unit_id}:
+                memory.core_visit = CoreVisit(
+                    unit_id,
+                    "HEAL",
+                    tick,
+                    reached_core=True,
+                )
+                unit.heal()
+            else:
+                unit.wait()
+            return True
+        heal_path = memory.cargo_lane.heal_approach_path
+        if origin in heal_path:
+            path_index = heal_path.index(origin)
+            if path_index + 1 < len(heal_path):
+                destination = heal_path[path_index + 1]
+                capacity_blocked = _unit_capacity_blocked(
+                    friendly_occupancy,
+                    reserved_destinations,
+                    actor_origin=origin,
+                )
+                if destination in movement_blocked or destination in capacity_blocked:
+                    unit.wait()
+                    return True
+                direction = _direction_between(origin, destination)
+                if direction is not None:
+                    _reserve_destination(reserved_destinations, destination)
+                    memory.note_unit_move(unit_id, destination, core_position)
+                    unit.move(direction)
+                    return True
+        if _queue_move(
+            unit,
+            core_position,
+            movement_blocked,
+            reserved_destinations,
+            friendly_occupancy=friendly_occupancy,
+            memory=memory,
+            tick=tick,
+        ):
+            return True
+        unit.wait()
+        return True
+
+    stage_target = memory.healing_defender_stage_target
+    if origin == stage_target:
+        unit.wait()
+        return True
+    lane_exclusions = _defender_heal_staging_exclusions(memory, core_position)
+    staging_blocked = set(movement_blocked) | lane_exclusions
+    staging_blocked.discard(origin)
+    if stage_target is not None and _queue_move(
+        unit,
+        stage_target,
+        staging_blocked,
+        reserved_destinations,
+        friendly_occupancy=friendly_occupancy,
+        memory=memory,
+        tick=tick,
+    ):
+        return True
+    unit.wait()
+    return True
+
+
 def _plan_vanguards(
     turn: Any,
     blocked: set[Position],
@@ -6737,12 +8154,6 @@ def _plan_vanguards(
             continue
 
         vanguard_key = str(getattr(vanguard, "id", ""))
-        _register_critical_healing(
-            turn,
-            vanguard,
-            memory,
-            core_position,
-        )
         if _is_critical_combat_unit(vanguard) and _queue_critical_combat_escape(
             vanguard,
             enemies,
@@ -6753,6 +8164,45 @@ def _plan_vanguards(
             friendly_occupancy,
             memory,
             tick,
+        ):
+            continue
+        if (
+            vanguard_key == memory.healing_defender_admitted_id
+            and _queue_healing_defender_action(
+                vanguard,
+                core_position,
+                movement_blocked | resource_cells,
+                reserved_destinations,
+                friendly_occupancy,
+                memory,
+                tick,
+            )
+        ):
+            continue
+        if vanguard_key in memory.cargo_lane.yield_unit_ids:
+            if _queue_cargo_lane_defender_yield(
+                vanguard,
+                memory.cargo_lane,
+                movement_blocked | resource_cells,
+                reserved_destinations,
+                friendly_occupancy,
+                memory,
+                tick,
+            ):
+                continue
+            vanguard.wait()
+            continue
+        if (
+            vanguard_key == memory.healing_defender_intent_id
+            and _queue_healing_defender_action(
+                vanguard,
+                core_position,
+                movement_blocked | resource_cells,
+                reserved_destinations,
+                friendly_occupancy,
+                memory,
+                tick,
+            )
         ):
             continue
         if vanguard_key in memory.raid.raid_member_ids:
@@ -6790,25 +8240,6 @@ def _plan_vanguards(
             vanguard.wait()
             continue
 
-        healing_return = (
-            vanguard_key in memory.healing_defender_ids
-            and core_position is not None
-        )
-        if healing_return:
-            if origin == core_position:
-                vanguard.heal()
-                continue
-            if _queue_move(
-                vanguard,
-                core_position,
-                movement_blocked,
-                reserved_destinations,
-                friendly_occupancy=friendly_occupancy,
-                memory=memory,
-                tick=tick,
-            ):
-                continue
-
         if enabled and enemies:
             adjacent = [
                 enemy
@@ -6823,10 +8254,6 @@ def _plan_vanguards(
             if target is not None:
                 vanguard.sweep(_adjacent_direction(origin, _position(target.position)))
                 continue
-
-        if healing_return:
-            vanguard.wait()
-            continue
 
         if enabled and allow_stationary_clear and slot > 0:
             nearby_stationary = [
@@ -6922,12 +8349,6 @@ def _plan_rangers(
             continue
 
         ranger_key = str(getattr(ranger, "id", ""))
-        _register_critical_healing(
-            turn,
-            ranger,
-            memory,
-            core_position,
-        )
         if _is_critical_combat_unit(ranger) and _queue_critical_combat_escape(
             ranger,
             enemies,
@@ -6938,6 +8359,45 @@ def _plan_rangers(
             friendly_occupancy,
             memory,
             tick,
+        ):
+            continue
+        if (
+            ranger_key == memory.healing_defender_admitted_id
+            and _queue_healing_defender_action(
+                ranger,
+                core_position,
+                movement_blocked | resource_cells,
+                reserved_destinations,
+                friendly_occupancy,
+                memory,
+                tick,
+            )
+        ):
+            continue
+        if ranger_key in memory.cargo_lane.yield_unit_ids:
+            if _queue_cargo_lane_defender_yield(
+                ranger,
+                memory.cargo_lane,
+                movement_blocked | resource_cells,
+                reserved_destinations,
+                friendly_occupancy,
+                memory,
+                tick,
+            ):
+                continue
+            ranger.wait()
+            continue
+        if (
+            ranger_key == memory.healing_defender_intent_id
+            and _queue_healing_defender_action(
+                ranger,
+                core_position,
+                movement_blocked | resource_cells,
+                reserved_destinations,
+                friendly_occupancy,
+                memory,
+                tick,
+            )
         ):
             continue
         if ranger_key in memory.raid.raid_member_ids:
@@ -6978,25 +8438,6 @@ def _plan_rangers(
             ranger.wait()
             continue
 
-        healing_return = (
-            ranger_key in memory.healing_defender_ids
-            and core_position is not None
-        )
-        if healing_return:
-            if origin == core_position:
-                ranger.heal()
-                continue
-            if _queue_move(
-                ranger,
-                core_position,
-                movement_blocked,
-                reserved_destinations,
-                friendly_occupancy=friendly_occupancy,
-                memory=memory,
-                tick=tick,
-            ):
-                continue
-
         if enabled:
             targets = [
                 enemy
@@ -7032,10 +8473,6 @@ def _plan_rangers(
             if target is not None:
                 ranger.shoot(target)
                 continue
-
-        if healing_return:
-            ranger.wait()
-            continue
 
         if core_position is not None:
             guard_target = guard_assignments.get(ranger_key, origin)
@@ -7167,6 +8604,10 @@ def _plan_core(
         return
     if int(getattr(core, "shield", 0) or 0) < 4 and resources >= 1:
         core.repair_shield()
+        return
+
+    if memory.core_visit.unit_id is not None:
+        core.wait()
         return
 
     if threat.level != "NORMAL":
@@ -7323,6 +8764,20 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         memory,
         core_accepts_delivery=core_accepts_delivery,
     )
+    # Refresh the concrete HEAL reservation before cargo admission. A timed-out
+    # healer may rotate, but an already-earned HEAL quota must not expose a
+    # one-Tick gap in which a new cargo owner can take the corridor.
+    _refresh_healing_workers(
+        turn,
+        memory,
+        _position(getattr(core, "position", None)),
+    )
+    _refresh_healing_defenders(
+        turn,
+        memory,
+        _position(getattr(core, "position", None)),
+        blocked | danger_cells,
+    )
     _update_cargo_lane(
         turn,
         _position(getattr(core, "position", None)),
@@ -7359,7 +8814,6 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         enemies,
         blocked,
     ) | set(memory.pursuing_enemy_ids)
-    _refresh_healing_defenders(turn, memory, core_position)
     enemy_positions = {
         position
         for position in (
@@ -7390,9 +8844,13 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
             _chebyshev_ring_positions(core_position, 1)
         )
         core_logistics_apron.update(memory.cargo_lane.path)
+        core_logistics_apron.update(memory.cargo_lane.owner_approach_path)
+        core_logistics_apron.update(memory.cargo_lane.heal_approach_path)
         core_logistics_apron.update(memory.cargo_lane.egress_path)
         core_logistics_apron.update(memory.cargo_lane.stage_targets.values())
         core_logistics_apron.discard(core_position)
+    if memory.healing_defender_stage_target is not None:
+        core_logistics_apron.add(memory.healing_defender_stage_target)
     core_logistics_apron.update(memory.planned_worker_destinations.values())
     vanguard_guards, vanguard_guard_positions, vanguard_idle = _assign_guard_posts(
         defending_vanguards,
