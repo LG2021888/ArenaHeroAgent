@@ -220,3 +220,50 @@ Only decisions with direct repository or runtime evidence are recorded here.
 - **Evidence:** Commit `91d6f52`, the historical Tick 94853 replay, the far
   attack/Cargo-lane regression, 8- and 12-cell boundary tests, emergency-spawn
   distance coverage, and the full 164-test suite.
+
+## 2026-08-13 - Bound Cargo-Lane Fairness And Preserve Queued Handoffs
+
+- **Decision:** Admit a Cargo owner from the route-length window of eight
+  steps, cap wait credit at eight Ticks, accrue credit only for staged Cargo
+  that is actually denied, and preserve a valid queued owner across EGRESS for
+  direct promotion. If no candidate is inside the window, select the nearest
+  reachable Cargo as a liveness fallback.
+- **Reason:** Long-running sessions let unbounded hold time erase distance
+  ordering. Far-away Workers then captured the only lane while nearby Cargo
+  waited, and a queued nearby owner could be discarded during EGRESS and lose
+  its place at the next global selection.
+- **Rejected alternative:** Let every Cargo Tick add unlimited priority, remove
+  fairness entirely, or re-run an unrestricted global selection after every
+  deposit.
+- **Impact:** Nearby staged Cargo normally owns the serial lane, waiting still
+  contributes bounded fairness, and a validated queued owner can take over at
+  the safe handoff boundary without changing half-duplex semantics.
+- **Evidence:** Commit `071bd26`, `_select_cargo_lane_owner`, staged wait-credit
+  accounting, queued-owner validation, and the owner admission/fairness/direct
+  handoff regression tests.
+
+## 2026-08-17 - Separate Healing Intent From Physical Core Access
+
+- **Decision:** Represent healing demand as an intent and staged priority,
+  while granting the single physical `core_visit` only to a Unit that has
+  reached the Core cell. Cargo already occupying the Core may always finish
+  its deposit. A reachable staged healer receives priority after at most three
+  completed deposits, and INBOUND/EGRESS watchdogs provide bounded recovery
+  without permitting two physical visitors.
+- **Reason:** Granting a remote healer exclusive Core ownership created a
+  circular wait with Cargo already standing on the Core. Conversely, allowing
+  Cargo to win every handoff could starve healing indefinitely. Scout-return
+  entries also needed explicit progress cleanup so return state could not
+  monopolize Worker planning forever.
+- **Rejected alternative:** Give remote healing intent an immediate exclusive
+  slot, allow deposit and heal visitors simultaneously, or permit Cargo to
+  postpone an eligible healer without a quota.
+- **Impact:** Core access remains a one-Unit physical invariant. Remote intent
+  is only a reservation, Core self-heal and shield repair remain independent,
+  spawn is suppressed while the physical slot is occupied, and healing,
+  Cargo, return, and watchdog state are visible in the replay trace.
+- **Evidence:** Commit `c301cf6`, `CoreVisit`, healing intent/admission state,
+  `phase_started_tick`, the 16-Tick lane watchdogs, scout-return progress
+  cleanup, and the 205-test suite. Later live evidence shows that Worker
+  staging/progress and repeated watchdog recovery still need refinement; that
+  open work does not change the physical-access decision.

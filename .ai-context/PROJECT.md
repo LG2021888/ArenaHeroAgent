@@ -73,6 +73,12 @@ closed-pocket and single-entrance geometry.
   and other Workers reserve the lane and egress path. Egress planning may
   cross temporary friendly occupancy so those Units can yield, but it must end
   on a currently unoccupied open component and replan if that endpoint closes.
+- Cargo-lane ownership uses an eight-step route admission window, bounded
+  eight-Tick wait credit, nearest-reachable fallback, and a queued owner that
+  survives EGRESS for direct handoff. Wait credit accrues only to staged Cargo
+  that was actually denied the lane. INBOUND and EGRESS have 16-Tick
+  watchdogs, but watchdog recovery must never violate physical half-duplex
+  ownership.
 - Keep exploration targets sticky per Worker. Use four Ticks without physical
   movement or three Ticks without route-cost improvement as scout stall
   signals; unreachable routes switch immediately. Resource assignment keeps
@@ -83,6 +89,11 @@ closed-pocket and single-entrance geometry.
   target instead of retrying forever.
 - Critically wounded defenders prioritize an immediately safer legal step and
   register for Core healing when resources and backup strength permit.
+  Injured empty Workers also register for healing. A healing intent is a queue
+  reservation, not physical Core ownership; the one-slot `core_visit` is
+  granted only to a Unit already on the Core cell. A staged healer may earn
+  priority after at most three completed deposits, while remote healing intent
+  must not stop Cargo startup or handoff.
 - Keep Worker-local combat memory separate from Core-level threat. Retain all
   hostile attack positions for Worker escape and return routing, but refresh
   Core recent-attack state only when the Core is targeted or the attack is
@@ -111,6 +122,9 @@ closed-pocket and single-entrance geometry.
   idempotency conflicts.
 - Workers discover resources, harvest, and continue depositing through
   congested or single-entrance Core geometry without permanent deadlock.
+- A valid queued Cargo owner must not remain behind an empty INBOUND/EGRESS
+  handoff for more than the watchdog bound, and a watchdog must make progress
+  rather than repeatedly rotating equally blocked owners.
 - Single-entrance delivery preserves half-duplex ordering: startup evacuation,
   inbound owner, deposit, complete egress to an open component, then next owner.
 - Production uses authoritative resources and dynamic SDK prices. Configured
@@ -120,6 +134,9 @@ closed-pocket and single-entrance geometry.
   long repeated `MOVE_DESTINATION_OCCUPIED` / `MOVE_CONTESTED` loops.
 - Enemy encounters trigger bounded defense, Worker evasion, critical Defender
   retreat, healing, and recall without unsafe chasing.
+- Injured Workers and defenders can reach the Core, produce
+  `UNIT_HEAL_SUCCEEDED`, and release the physical visit slot without starving
+  Cargo or Core production.
 - A distant Worker attack preserves local escape memory without escalating the
   whole base, dismantling an active Cargo lane, or moving the Core.
 - `CORE_RESOURCES_CAPTURED` from destroying an enemy Core does not put the
