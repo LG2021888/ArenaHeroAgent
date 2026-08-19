@@ -5600,12 +5600,47 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertEqual(memory.raid.state, "CORE_RECALL")
 
     def test_status_panel_uses_localized_labels(self):
-        worker = FakeActor("worker", (3, 4), cargo=1)
+        workers = (
+            FakeActor("worker-1", (3, 4), cargo=1),
+            FakeActor("worker-2", (4, 4), cargo=0),
+            FakeActor("worker-3", (5, 4), cargo=2),
+        )
+        workers[2].hp = 1
+        vanguards = (
+            FakeActor("vanguard-1", (6, 4), unit_type=UnitType.VANGUARD),
+            FakeActor("vanguard-2", (7, 4), unit_type=UnitType.VANGUARD),
+        )
+        vanguards[0].hp = 4
+        vanguards[1].hp = 2
+        rangers = (
+            FakeActor("ranger-1", (8, 4), unit_type=UnitType.RANGER),
+            FakeActor("ranger-2", (9, 4), unit_type=UnitType.RANGER),
+        )
+        rangers[1].hp = 1
         core = FakeActor("core", (1, 2))
-        turn = make_turn(worker=worker, core=core)
+        turn = make_turn(worker=workers[0], core=core)
+        turn.workers = workers
+        turn.vanguards = vanguards
+        turn.rangers = rangers
+        turn.units = workers + vanguards + rangers
         turn.resource_capacity = 20
         turn.state.status = CoreState.NORMAL
-        report = PlanReport(12, 7, 1, 1, 0, 0, 0, 2, 1)
+        report = PlanReport(
+            12,
+            7,
+            7,
+            3,
+            2,
+            2,
+            0,
+            2,
+            1,
+            vanguard_defenders=1,
+            vanguard_raid=1,
+            vanguard_attacks=1,
+            ranger_defenders=2,
+            ranger_attacks=1,
+        )
         output = StringIO()
 
         with redirect_stdout(output):
@@ -5614,10 +5649,56 @@ class ArenaAgentTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("控制台", rendered)
         self.assertIn("回合:12", rendered)
-        self.assertIn("工人1", rendered)
+        self.assertIn(
+            "工人状态: 总数:3   携货:2   空手:1   货物合计:3   血量:5/6   未满血:1",
+            rendered,
+        )
+        self.assertIn(
+            "先锋状态: 防守:1   出征:1   本轮攻击:1   血量:6/8   未满血:1   危急:1",
+            rendered,
+        )
+        self.assertIn(
+            "游侠状态: 防守:2   出征:0   本轮攻击:1   血量:3/4   未满血:1   危急:1",
+            rendered,
+        )
+        self.assertNotIn("工人1", rendered)
+        self.assertNotIn("(3, 4)", rendered)
         self.assertIn("生产报价", rendered)
         self.assertNotIn("维护", rendered)
         self.assertNotIn("Tick", rendered)
+
+    def test_plan_report_counts_combat_attacks_and_defenders(self):
+        core = FakeActor("core", (0, 0))
+        core.hp = 5
+        vanguard = FakeActor(
+            "vanguard",
+            (0, 1),
+            unit_type=UnitType.VANGUARD,
+        )
+        vanguard.hp = 4
+        ranger = FakeActor("ranger", (0, 2), unit_type=UnitType.RANGER)
+        enemy = FakeActor("enemy", (1, 1), unit_type=UnitType.VANGUARD)
+        enemy.hp = 4
+        turn = make_turn(worker=None, core=core, enemies=(enemy,))
+        turn.vanguards = (vanguard,)
+        turn.rangers = (ranger,)
+        turn.units = (vanguard, ranger)
+        turn.state.population = 2
+
+        report = plan_turn(
+            turn,
+            TacticMemory(),
+            AgentConfig(spawn_unit_type=None),
+        )
+
+        self.assertEqual(vanguard.actions, [("SWEEP", Direction.RIGHT)])
+        self.assertEqual(ranger.actions, [("SHOOT", "enemy")])
+        self.assertEqual(report.vanguard_defenders, 1)
+        self.assertEqual(report.vanguard_raid, 0)
+        self.assertEqual(report.vanguard_attacks, 1)
+        self.assertEqual(report.ranger_defenders, 1)
+        self.assertEqual(report.ranger_raid, 0)
+        self.assertEqual(report.ranger_attacks, 1)
 
 
 if __name__ == "__main__":

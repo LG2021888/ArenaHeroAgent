@@ -197,6 +197,56 @@ def _format_position(value: Any) -> str:
     return f"({position[0]}, {position[1]})" if position is not None else "-"
 
 
+def _unit_health_summary(
+    units: Iterable[Any],
+    unit_type: UnitType,
+) -> tuple[int, int, int, int]:
+    unit_list = tuple(units)
+    max_hp_per_unit = _unit_max_hp(unit_type)
+    critical_hp = _critical_combat_hp(unit_type)
+    hit_points = [
+        max(
+            0,
+            min(
+                max_hp_per_unit,
+                int(getattr(unit, "hp", max_hp_per_unit)),
+            ),
+        )
+        for unit in unit_list
+    ]
+    return (
+        sum(hit_points),
+        len(unit_list) * max_hp_per_unit,
+        sum(hp < max_hp_per_unit for hp in hit_points),
+        sum(critical_hp > 0 and hp <= critical_hp for hp in hit_points),
+    )
+
+
+def _planned_combat_attack_counts(turn: Any) -> tuple[int, int]:
+    plan = getattr(turn, "plan", None)
+    planned_actions = getattr(plan, "unit_actions", {}) if plan is not None else {}
+
+    def action_type(unit: Any) -> str | None:
+        action = planned_actions.get(getattr(unit, "id", None))
+        if action is not None:
+            return str(getattr(action, "type", "")).upper()
+        fake_actions = getattr(unit, "actions", ())
+        if fake_actions:
+            return str(fake_actions[-1][0]).upper()
+        return None
+
+    return (
+        sum(
+            action_type(unit) == "SWEEP"
+            for unit in getattr(turn, "vanguards", ())
+        ),
+        sum(
+            action_type(unit) == "SHOOT"
+            for unit in getattr(turn, "rangers", ())
+        ),
+    )
+
+
 def _state_label(value: Any) -> str:
     raw_name = getattr(value, "name", None) or str(value).rsplit(".", 1)[-1]
     state_name = str(raw_name).upper()
@@ -243,11 +293,25 @@ def _render_turn(turn: Any, report: "PlanReport", accepted: Any) -> None:
         else "-"
     )
     workers = getattr(turn, "workers", ())
-    worker_parts = [
-        f"\u5de5\u4eba{index} {_format_position(getattr(worker, 'position', None))} "
-        f"\u8d27\u7269:{getattr(worker, 'cargo', '?')}"
-        for index, worker in enumerate(workers, start=1)
-    ]
+    worker_cargo = [max(0, int(getattr(worker, "cargo", 0) or 0)) for worker in workers]
+    carrying_workers = sum(cargo > 0 for cargo in worker_cargo)
+    empty_workers = len(worker_cargo) - carrying_workers
+    total_cargo = sum(worker_cargo)
+    worker_hp, worker_max_hp, injured_workers, _ = _unit_health_summary(
+        workers,
+        UnitType.WORKER,
+    )
+    vanguards = tuple(getattr(turn, "vanguards", ()))
+    rangers = tuple(getattr(turn, "rangers", ()))
+    (
+        vanguard_hp,
+        vanguard_max_hp,
+        injured_vanguards,
+        critical_vanguards,
+    ) = _unit_health_summary(vanguards, UnitType.VANGUARD)
+    ranger_hp, ranger_max_hp, injured_rangers, critical_rangers = (
+        _unit_health_summary(rangers, UnitType.RANGER)
+    )
     lifecycle_labels = {
         "ACTIVE": "运行中",
         "RESPAWNING": "重生中",
@@ -279,11 +343,24 @@ def _render_turn(turn: Any, report: "PlanReport", accepted: Any) -> None:
     print(f"\u2502 \u6838\u5fc3\u4f4d\u7f6e:{_format_position(core_position)}   \u8d44\u6e90:{report.resources}/{capacity}   \u53ef\u63a5\u6536:{resource_space}   \u4eba\u53e3:{report.population}")
     print(f"\u2502 \u751f\u4ea7\u62a5\u4ef7:{production_label}={production_cost}   \u53ef\u7528\u8d44\u6e90:{available_resources}   \u672c轮交付:+{report.pending_delivery}")
     print(f"\u2502 \u5355\u4f4d\u7edf\u8ba1: \u5de5\u4eba:{report.workers}   \u5148\u950b:{report.vanguards}   \u6e38\u4fa0:{report.rangers}")
-    if worker_parts:
-        for worker_line in worker_parts:
-            print(f"\u2502 {worker_line}")
-    else:
-        print("\u2502 \u5de5\u4eba\u72b6\u6001: \u65e0")
+    print(
+        f"\u2502 \u5de5\u4eba\u72b6\u6001: \u603b\u6570:{len(worker_cargo)}   "
+        f"\u643a\u8d27:{carrying_workers}   \u7a7a\u624b:{empty_workers}   "
+        f"\u8d27\u7269\u5408\u8ba1:{total_cargo}   "
+        f"\u8840\u91cf:{worker_hp}/{worker_max_hp}   \u672a\u6ee1\u8840:{injured_workers}"
+    )
+    print(
+        f"\u2502 \u5148\u950b\u72b6\u6001: \u9632\u5b88:{report.vanguard_defenders}   "
+        f"\u51fa\u5f81:{report.vanguard_raid}   \u672c\u8f6e\u653b\u51fb:{report.vanguard_attacks}   "
+        f"\u8840\u91cf:{vanguard_hp}/{vanguard_max_hp}   "
+        f"\u672a\u6ee1\u8840:{injured_vanguards}   \u5371\u6025:{critical_vanguards}"
+    )
+    print(
+        f"\u2502 \u6e38\u4fa0\u72b6\u6001: \u9632\u5b88:{report.ranger_defenders}   "
+        f"\u51fa\u5f81:{report.ranger_raid}   \u672c\u8f6e\u653b\u51fb:{report.ranger_attacks}   "
+        f"\u8840\u91cf:{ranger_hp}/{ranger_max_hp}   "
+        f"\u672a\u6ee1\u8840:{injured_rangers}   \u5371\u6025:{critical_rangers}"
+    )
     print(f"\u2502 \u89c6\u91ce\u8d44\u6e90:{report.visible_resources}   \u8bb0\u5fc6\u8d44\u6e90:{report.remembered_resources}   \u654c\u4eba:{report.visible_enemies}   \u6218\u6597\u654c\u4eba:{report.visible_combat_enemies}   \u5371\u9669\u683c:{report.danger_cells}   \u5a01\u80c1:{threat}   \u969c\u788d:{obstacle_count}")
     print("\u2570" + border + "\u256f")
 
@@ -1619,6 +1696,12 @@ class PlanReport:
     danger_cells: int = 0
     pursuing_enemies: int = 0
     preemptive_enemies: int = 0
+    vanguard_defenders: int = 0
+    vanguard_raid: int = 0
+    vanguard_attacks: int = 0
+    ranger_defenders: int = 0
+    ranger_raid: int = 0
+    ranger_attacks: int = 0
 
 
 def _position(value: Any) -> Position | None:
@@ -8948,6 +9031,16 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
             for worker in getattr(turn, "workers", ())
         ),
     )
+    vanguard_attacks, ranger_attacks = _planned_combat_attack_counts(turn)
+    raid_ids = set(memory.raid.raid_member_ids)
+    vanguard_raid = sum(
+        str(getattr(unit, "id", "")) in raid_ids
+        for unit in getattr(turn, "vanguards", ())
+    )
+    ranger_raid = sum(
+        str(getattr(unit, "id", "")) in raid_ids
+        for unit in getattr(turn, "rangers", ())
+    )
 
     return PlanReport(
         tick=int(turn.tick),
@@ -8971,6 +9064,12 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         danger_cells=len(danger_cells),
         pursuing_enemies=len(memory.pursuing_enemy_ids),
         preemptive_enemies=len(memory.preemptive_enemy_ids),
+        vanguard_defenders=len(tuple(defending_vanguards)),
+        vanguard_raid=vanguard_raid,
+        vanguard_attacks=vanguard_attacks,
+        ranger_defenders=len(tuple(defending_rangers)),
+        ranger_raid=ranger_raid,
+        ranger_attacks=ranger_attacks,
     )
 
 
