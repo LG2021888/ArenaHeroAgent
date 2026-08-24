@@ -78,10 +78,18 @@ HEAL_VISIT_TIMEOUT_TICKS = 12
 HEAL_INTENT_TIMEOUT_TICKS = 12
 HEAL_INTENT_COOLDOWN_TICKS = 12
 HEAL_PRIORITY_DEPOSIT_LIMIT = 3
+CRITICAL_DEFENDER_HEAL_MAX_WAIT_TICKS = 8
+CRITICAL_DEFENDER_HEAL_MIN_DEPOSITS = 1
 DEFENDER_HEAL_ADMISSION_TIMEOUT_TICKS = 16
 DEFENDER_HEAL_COOLDOWN_TICKS = 12
+HEAL_PRIORITY_MAX_ADMISSION_TIMEOUTS = 2
+HEAL_PRIORITY_MAX_HOLD_TICKS = (
+    DEFENDER_HEAL_ADMISSION_TIMEOUT_TICKS
+    * HEAL_PRIORITY_MAX_ADMISSION_TIMEOUTS
+)
 CARGO_LANE_INBOUND_WATCHDOG_TICKS = 16
 CARGO_LANE_EGRESS_WATCHDOG_TICKS = 16
+CARGO_LANE_STALLED_OWNER_COOLDOWN_TICKS = 16
 SCOUT_POSITION_HISTORY_SIZE = 6
 SCOUT_RECENT_POSITION_PENALTY = 4
 STATIONARY_CONFIRMATION_TICKS = 2
@@ -361,6 +369,18 @@ def _render_turn(turn: Any, report: "PlanReport", accepted: Any) -> None:
         f"\u8840\u91cf:{ranger_hp}/{ranger_max_hp}   "
         f"\u672a\u6ee1\u8840:{injured_rangers}   \u5371\u6025:{critical_rangers}"
     )
+    watchdog = report.cargo_watchdog_reason or "\u65e0"
+    print(
+        f"\u2502 \u7269\u6d41\u901a\u9053: {report.cargo_lane_phase}   "
+        f"\u8ba9\u8def \u5de5\u4eba:{report.cargo_lane_yield_workers} \u6218\u6597:{report.cargo_lane_yield_units}   "
+        f"\u770b\u95e8\u72d7:{watchdog}"
+    )
+    print(
+        f"\u2502 \u6cbb\u7597\u901a\u884c: {'\u8fdb\u884c\u4e2d' if report.heal_priority_active else '\u65e0'}   "
+        f"\u5df2\u51c6\u5165:{'\u662f' if report.healing_defender_admitted else '\u5426'}   "
+        f"\u7b49\u5f85:{report.heal_priority_wait_ticks}\u56de\u5408   "
+        f"Cargo\u7a7f\u63d2:{'\u662f' if report.heal_priority_interleave_pending else '\u5426'}"
+    )
     print(f"\u2502 \u89c6\u91ce\u8d44\u6e90:{report.visible_resources}   \u8bb0\u5fc6\u8d44\u6e90:{report.remembered_resources}   \u654c\u4eba:{report.visible_enemies}   \u6218\u6597\u654c\u4eba:{report.visible_combat_enemies}   \u5371\u9669\u683c:{report.danger_cells}   \u5a01\u80c1:{threat}   \u969c\u788d:{obstacle_count}")
     print("\u2570" + border + "\u256f")
 
@@ -378,7 +398,9 @@ def _log_turn_summary(report: "PlanReport", accepted: Any) -> None:
         "vanguards=%s rangers=%s enemies=%s combat_enemies=%s "
         "danger_cells=%s pursuing=%s preemptive=%s threat=%s reason=%s "
         "lifecycle=%s mission=%s production=%s cost=%s available=%s "
-        "pending_delivery=%s",
+        "pending_delivery=%s cargo_lane=%s cargo_yield_workers=%s "
+        "cargo_yield_units=%s cargo_watchdog=%s heal_priority=%s "
+        "heal_admitted=%s heal_wait_ticks=%s heal_interleave=%s",
         report.tick,
         accepted_value,
         report.resources,
@@ -399,6 +421,14 @@ def _log_turn_summary(report: "PlanReport", accepted: Any) -> None:
         report.production_cost,
         report.available_resources,
         report.pending_delivery,
+        report.cargo_lane_phase,
+        report.cargo_lane_yield_workers,
+        report.cargo_lane_yield_units,
+        report.cargo_watchdog_reason,
+        report.heal_priority_active,
+        report.healing_defender_admitted,
+        report.heal_priority_wait_ticks,
+        report.heal_priority_interleave_pending,
     )
 
 
@@ -591,6 +621,9 @@ class CargoLanePlan:
     startup_pending_ids: set[str] = field(default_factory=set)
     yield_worker_ids: set[str] = field(default_factory=set)
     yield_unit_ids: set[str] = field(default_factory=set)
+    core_release_hold_unit_ids: set[str] = field(default_factory=set)
+    yield_targets: dict[str, Position] = field(default_factory=dict)
+    yield_paths: dict[str, tuple[Position, ...]] = field(default_factory=dict)
     stage_targets: dict[str, Position] = field(default_factory=dict)
     started_tick: int = 0
     phase_started_tick: int = 0
@@ -677,6 +710,7 @@ class TacticMemory:
     healing_defender_best_distance: int | None = None
     healing_defender_last_progress_tick: int = -1
     healing_defender_last_position: Position | None = None
+    healing_defender_timeout_tick: int = -1
     healing_defender_cooldowns: dict[str, int] = field(default_factory=dict)
     healing_worker_ids: set[str] = field(default_factory=set)
     # A healing intent is a queue reservation, not physical Core ownership.
@@ -718,7 +752,13 @@ class TacticMemory:
     core_visit_deposit_streak: int = 0
     core_visit_forced_purpose: str | None = None
     heal_priority_intent_id: str | None = None
+    heal_priority_started_tick: int = -1
+    heal_priority_admission_timeouts: int = 0
+    heal_priority_interleave_pending: bool = False
     cargo_lane_wait_ticks: dict[str, int] = field(default_factory=dict)
+    cargo_lane_stalled_owners: dict[str, tuple[Position, int]] = field(
+        default_factory=dict
+    )
     core_lane_departing_worker_id: str | None = None
     core_lane_yield_worker_ids: set[str] = field(default_factory=set)
     core_observer_return_ids: set[str] = field(default_factory=set)
@@ -809,6 +849,10 @@ class TacticMemory:
             if visit_unit is None or deposit_finished or heal_finished or heal_left_core or heal_timed_out:
                 if self.core_visit.purpose == "DEPOSIT":
                     self.core_visit_deposit_streak += 1
+                    if self.heal_priority_interleave_pending:
+                        self.heal_priority_interleave_pending = False
+                        self.heal_priority_admission_timeouts = 0
+                        self.heal_priority_started_tick = tick
                 elif self.core_visit.purpose == "HEAL":
                     healing_defender_visit = (
                         self.core_visit.unit_id
@@ -818,6 +862,9 @@ class TacticMemory:
                     self.core_visit_deposit_streak = 0
                     self.core_visit_forced_purpose = None
                     self.heal_priority_intent_id = None
+                    self.heal_priority_started_tick = -1
+                    self.heal_priority_admission_timeouts = 0
+                    self.heal_priority_interleave_pending = False
                     if heal_timed_out and self.heal_intent_id == self.core_visit.unit_id:
                         self.heal_intent_cooldowns[self.heal_intent_id] = (
                             tick + HEAL_INTENT_COOLDOWN_TICKS
@@ -846,16 +893,26 @@ class TacticMemory:
                         self.healing_defender_last_position = None
                 self.core_visit = CoreVisit()
         living_worker_ids: set[str] = set()
+        living_worker_positions: dict[str, Position] = {}
         for worker in getattr(turn, "workers", ()):
             worker_key = str(getattr(worker, "id", ""))
             position = _position(getattr(worker, "position", None))
             if not worker_key or position is None:
                 continue
             living_worker_ids.add(worker_key)
+            living_worker_positions[worker_key] = position
             history = self.worker_position_history.setdefault(worker_key, [])
             if not history or history[-1] != position:
                 history.append(position)
                 del history[:-SCOUT_POSITION_HISTORY_SIZE]
+        self.cargo_lane_stalled_owners = {
+            worker_key: (stalled_position, expires_at)
+            for worker_key, (stalled_position, expires_at) in (
+                self.cargo_lane_stalled_owners.items()
+            )
+            if expires_at > tick
+            and living_worker_positions.get(worker_key) == stalled_position
+        }
         for worker_key in set(self.worker_position_history) - living_worker_ids:
             self.worker_position_history.pop(worker_key, None)
             self.worker_routes.pop(worker_key, None)
@@ -1702,6 +1759,14 @@ class PlanReport:
     ranger_defenders: int = 0
     ranger_raid: int = 0
     ranger_attacks: int = 0
+    cargo_lane_phase: str = "IDLE"
+    cargo_lane_yield_workers: int = 0
+    cargo_lane_yield_units: int = 0
+    cargo_watchdog_reason: str | None = None
+    heal_priority_active: bool = False
+    healing_defender_admitted: bool = False
+    heal_priority_wait_ticks: int = 0
+    heal_priority_interleave_pending: bool = False
 
 
 def _position(value: Any) -> Position | None:
@@ -2050,8 +2115,24 @@ class SessionStats:
     threat_counts: dict[str, int] = field(default_factory=dict)
     mission_counts: dict[str, int] = field(default_factory=dict)
     event_counts: dict[str, int] = field(default_factory=dict)
+    last_deposit_tick: int | None = None
+    max_deposit_gap_ticks: int = 0
+    current_injured_units: int = 0
+    max_injured_units: int = 0
+    current_critical_combat_units: int = 0
+    max_critical_combat_units: int = 0
+    max_heal_priority_wait_ticks: int = 0
+    healing_admission_timeouts: int = 0
+    cargo_watchdog_counts: dict[str, int] = field(default_factory=dict)
+    runtime_error_counts: dict[str, int] = field(default_factory=dict)
 
-    def record(self, turn: Any, report: PlanReport, accepted: Any) -> None:
+    def record(
+        self,
+        turn: Any,
+        report: PlanReport,
+        accepted: Any,
+        memory: TacticMemory | None = None,
+    ) -> None:
         accepted_value = (
             accepted
             if isinstance(accepted, bool)
@@ -2077,9 +2158,60 @@ class SessionStats:
         self.mission_counts[report.mission] = (
             self.mission_counts.get(report.mission, 0) + 1
         )
+        event_names = []
         for event in getattr(turn, "events", ()):
             event_name = _event_label(event)
+            event_names.append(event_name)
             self.event_counts[event_name] = self.event_counts.get(event_name, 0) + 1
+        if "DEPOSIT_SUCCEEDED" in event_names:
+            if self.last_deposit_tick is not None:
+                self.max_deposit_gap_ticks = max(
+                    self.max_deposit_gap_ticks,
+                    report.tick - self.last_deposit_tick,
+                )
+            self.last_deposit_tick = report.tick
+        workers = tuple(getattr(turn, "workers", ()))
+        vanguards = tuple(getattr(turn, "vanguards", ()))
+        rangers = tuple(getattr(turn, "rangers", ()))
+        injured_counts = (
+            _unit_health_summary(workers, UnitType.WORKER)[2],
+            _unit_health_summary(vanguards, UnitType.VANGUARD)[2],
+            _unit_health_summary(rangers, UnitType.RANGER)[2],
+        )
+        critical_counts = (
+            _unit_health_summary(vanguards, UnitType.VANGUARD)[3],
+            _unit_health_summary(rangers, UnitType.RANGER)[3],
+        )
+        self.current_injured_units = sum(injured_counts)
+        self.max_injured_units = max(
+            self.max_injured_units,
+            self.current_injured_units,
+        )
+        self.current_critical_combat_units = sum(critical_counts)
+        self.max_critical_combat_units = max(
+            self.max_critical_combat_units,
+            self.current_critical_combat_units,
+        )
+        if memory is not None and memory.heal_priority_started_tick >= 0:
+            self.max_heal_priority_wait_ticks = max(
+                self.max_heal_priority_wait_ticks,
+                report.tick - memory.heal_priority_started_tick,
+            )
+        if (
+            memory is not None
+            and memory.healing_defender_timeout_tick == report.tick
+        ):
+            self.healing_admission_timeouts += 1
+        lane = memory.cargo_lane if memory is not None else None
+        if lane is not None and lane.watchdog_tick == report.tick and lane.watchdog_reason:
+            self.cargo_watchdog_counts[lane.watchdog_reason] = (
+                self.cargo_watchdog_counts.get(lane.watchdog_reason, 0) + 1
+            )
+
+    def record_runtime_error(self, category: str) -> None:
+        self.runtime_error_counts[category] = (
+            self.runtime_error_counts.get(category, 0) + 1
+        )
 
     def as_dict(self, finished_at: str | None = None) -> dict[str, Any]:
         return {
@@ -2099,6 +2231,22 @@ class SessionStats:
             "threat_counts": dict(sorted(self.threat_counts.items())),
             "mission_counts": dict(sorted(self.mission_counts.items())),
             "event_counts": dict(sorted(self.event_counts.items())),
+            "last_deposit_tick": self.last_deposit_tick,
+            "max_deposit_gap_ticks": self.max_deposit_gap_ticks,
+            "current_injured_units": self.current_injured_units,
+            "max_injured_units": self.max_injured_units,
+            "current_critical_combat_units": (
+                self.current_critical_combat_units
+            ),
+            "max_critical_combat_units": self.max_critical_combat_units,
+            "max_heal_priority_wait_ticks": self.max_heal_priority_wait_ticks,
+            "healing_admission_timeouts": self.healing_admission_timeouts,
+            "cargo_watchdog_counts": dict(
+                sorted(self.cargo_watchdog_counts.items())
+            ),
+            "runtime_error_counts": dict(
+                sorted(self.runtime_error_counts.items())
+            ),
         }
 
 
@@ -2138,6 +2286,31 @@ class SessionRecorder:
             return
         events = [_event_label(event) for event in getattr(turn, "events", ())]
         workers = list(getattr(turn, "workers", ()))
+        healing_defender = next(
+            (
+                unit
+                for unit in tuple(getattr(turn, "vanguards", ()))
+                + tuple(getattr(turn, "rangers", ()))
+                if str(getattr(unit, "id", ""))
+                == memory.healing_defender_intent_id
+            ),
+            None,
+        )
+        critical_heal_wait_exhausted = _critical_defender_heal_wait_exhausted(
+            turn,
+            healing_defender,
+            memory,
+            memory.heal_priority_intent_id,
+            report.tick,
+        )
+        heal_force_reason = None
+        if memory.core_visit_forced_purpose == "HEAL":
+            if critical_heal_wait_exhausted:
+                heal_force_reason = "CRITICAL_WAIT_LIMIT"
+            elif memory.core_visit_deposit_streak >= HEAL_PRIORITY_DEPOSIT_LIMIT:
+                heal_force_reason = "DEPOSIT_QUOTA"
+            elif memory.healing_defender_admitted_id is not None:
+                heal_force_reason = "ADMITTED"
         payload = {
             "session_id": _AGENT_SESSION_ID,
             "tick": report.tick,
@@ -2222,6 +2395,12 @@ class SessionRecorder:
                 "candidate_ids": sorted(memory.healing_defender_ids),
                 "intent_id": memory.healing_defender_intent_id,
                 "intent_tick": memory.healing_defender_intent_tick,
+                "intent_wait_ticks": (
+                    max(0, report.tick - memory.healing_defender_intent_tick)
+                    if memory.healing_defender_intent_tick >= 0
+                    else 0
+                ),
+                "critical_wait_exhausted": critical_heal_wait_exhausted,
                 "stage_target": _json_position(
                     memory.healing_defender_stage_target
                 ),
@@ -2233,6 +2412,7 @@ class SessionRecorder:
                 "last_position": _json_position(
                     memory.healing_defender_last_position
                 ),
+                "last_timeout_tick": memory.healing_defender_timeout_tick,
                 "approach_path": [
                     _json_position(position)
                     for position in memory.cargo_lane.heal_approach_path
@@ -2248,7 +2428,15 @@ class SessionRecorder:
                 "granted_tick": memory.core_visit.granted_tick,
                 "deposit_streak": memory.core_visit_deposit_streak,
                 "forced_purpose": memory.core_visit_forced_purpose,
+                "heal_force_reason": heal_force_reason,
                 "heal_priority_intent_id": memory.heal_priority_intent_id,
+                "heal_priority_started_tick": memory.heal_priority_started_tick,
+                "heal_priority_admission_timeouts": (
+                    memory.heal_priority_admission_timeouts
+                ),
+                "heal_priority_interleave_pending": (
+                    memory.heal_priority_interleave_pending
+                ),
             },
             "scout_progress": {
                 worker_id: {
@@ -2308,6 +2496,17 @@ class SessionRecorder:
                 "startup_pending_ids": sorted(lane.startup_pending_ids),
                 "yield_worker_ids": sorted(lane.yield_worker_ids),
                 "yield_unit_ids": sorted(lane.yield_unit_ids),
+                "core_release_hold_unit_ids": sorted(
+                    lane.core_release_hold_unit_ids
+                ),
+                "yield_targets": {
+                    unit_id: _json_position(target)
+                    for unit_id, target in sorted(lane.yield_targets.items())
+                },
+                "yield_paths": {
+                    unit_id: [_json_position(position) for position in path]
+                    for unit_id, path in sorted(lane.yield_paths.items())
+                },
                 "stage_targets": {
                     worker_id: _json_position(target)
                     for worker_id, target in sorted(lane.stage_targets.items())
@@ -2328,6 +2527,15 @@ class SessionRecorder:
                     lane.departing_best_remaining_steps
                 ),
                 "departing_last_progress_tick": lane.departing_last_progress_tick,
+                "stalled_owner_cooldowns": {
+                    worker_id: {
+                        "position": _json_position(position),
+                        "expires_at": expires_at,
+                    }
+                    for worker_id, (position, expires_at) in sorted(
+                        memory.cargo_lane_stalled_owners.items()
+                    )
+                },
             }
         active_contested = {
             worker_id: [
@@ -2364,7 +2572,7 @@ class SessionRecorder:
         self.trace_logger.info(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         )
-        self.stats.record(turn, report, accepted)
+        self.stats.record(turn, report, accepted, memory)
         if self.stats.ticks % STATS_SAVE_INTERVAL_TICKS == 0:
             self.save_stats()
 
@@ -2383,6 +2591,10 @@ class SessionRecorder:
                 temporary_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def record_runtime_error(self, category: str) -> None:
+        self.stats.record_runtime_error(category)
+        self.save_stats()
 
     def close(self) -> None:
         if self._closed:
@@ -4099,6 +4311,18 @@ def _select_cargo_lane_owner(
         )
     if not candidates:
         return None, None
+    tick = int(memory.last_observed_tick or 0)
+    unpenalized = [
+        candidate
+        for candidate in candidates
+        if not (
+            (penalty := memory.cargo_lane_stalled_owners.get(candidate[3]))
+            and penalty[1] > tick
+            and _position(getattr(candidate[4], "position", None)) == penalty[0]
+        )
+    ]
+    if unpenalized:
+        candidates = unpenalized
     admitted = [
         candidate
         for candidate in candidates
@@ -4585,14 +4809,48 @@ def _healing_priority_defender(
         and _chebyshev(position, core_position)
         <= max(CARGO_LANE_STAGE_RADII)
     )
-    if not near_idle_core and (
+    within_staging_ring = (
+        _chebyshev(position, core_position) <= max(CARGO_LANE_STAGE_RADII)
+    )
+    if not near_idle_core and not within_staging_ring and (
         memory.healing_defender_stage_target is None
         or position != memory.healing_defender_stage_target
-        or _chebyshev(position, core_position) > max(CARGO_LANE_STAGE_RADII)
     ):
         return None
     route = _complete_route(position, core_position, blocked | danger_cells)
     return defender if route.status == "SUCCESS" else None
+
+
+def _critical_defender_heal_wait_exhausted(
+    turn: Any,
+    defender: Any | None,
+    memory: TacticMemory,
+    intent_id: str | None,
+    tick: int,
+) -> bool:
+    if (
+        defender is None
+        or intent_id is None
+        or str(getattr(defender, "id", "")) != intent_id
+        or memory.healing_defender_intent_tick < 0
+    ):
+        return False
+    max_hp = _unit_max_hp(getattr(defender, "unit_type", UnitType.WORKER))
+    critical = int(getattr(defender, "hp", max_hp)) * 2 <= max_hp
+    waited_long_enough = (
+        tick - memory.healing_defender_intent_tick
+        >= CRITICAL_DEFENDER_HEAL_MAX_WAIT_TICKS
+    )
+    cargo_waiting = any(
+        int(getattr(worker, "cargo", 0)) > 0
+        for worker in getattr(turn, "workers", ())
+    )
+    cargo_turn_preserved = (
+        memory.core_visit_deposit_streak
+        >= CRITICAL_DEFENDER_HEAL_MIN_DEPOSITS
+        or not cargo_waiting
+    )
+    return critical and waited_long_enough and cargo_turn_preserved
 
 
 def _refresh_healing_priority(
@@ -4642,10 +4900,18 @@ def _refresh_healing_priority(
                 str(getattr(defender, "id", "")),
             )
         )
-    candidate_ids = {candidate[2] for candidate in priority_candidates}
+    ready_candidate_ids = {candidate[2] for candidate in priority_candidates}
+    rotated_priority_ids = {
+        memory.healing_defender_intent_id
+    } if (
+        memory.heal_priority_admission_timeouts > 0
+        and memory.healing_defender_intent_id is not None
+        and memory.healing_defender_intent_id in memory.healing_defender_ids
+    ) else set()
     intent_id = (
         memory.heal_priority_intent_id
-        if memory.heal_priority_intent_id in candidate_ids
+        if memory.heal_priority_intent_id
+        in ready_candidate_ids | rotated_priority_ids
         else min(priority_candidates)[2]
         if priority_candidates
         else None
@@ -4654,17 +4920,44 @@ def _refresh_healing_priority(
         memory.heal_priority_intent_id = None
         memory.core_visit_deposit_streak = 0
         memory.core_visit_forced_purpose = None
+        memory.heal_priority_started_tick = -1
+        memory.heal_priority_admission_timeouts = 0
+        memory.heal_priority_interleave_pending = False
         return False
     if memory.heal_priority_intent_id != intent_id:
         memory.heal_priority_intent_id = intent_id
         memory.core_visit_deposit_streak = 0
         memory.core_visit_forced_purpose = None
-    if (
+        memory.heal_priority_started_tick = -1
+        memory.heal_priority_admission_timeouts = 0
+        memory.heal_priority_interleave_pending = False
+    tick = int(getattr(turn, "tick", 0))
+    force_heal = (
         memory.healing_defender_admitted_id == intent_id
         or memory.core_visit_deposit_streak >= HEAL_PRIORITY_DEPOSIT_LIMIT
+        or _critical_defender_heal_wait_exhausted(
+            turn,
+            defender,
+            memory,
+            intent_id,
+            tick,
+        )
+    )
+    if force_heal and memory.heal_priority_started_tick < 0:
+        memory.heal_priority_started_tick = tick
+    if (
+        force_heal
+        and memory.healing_defender_admitted_id is None
+        and memory.heal_priority_started_tick >= 0
+        and tick - memory.heal_priority_started_tick
+        >= HEAL_PRIORITY_MAX_HOLD_TICKS
     ):
+        memory.heal_priority_interleave_pending = True
+    if force_heal and not memory.heal_priority_interleave_pending:
         memory.core_visit_forced_purpose = "HEAL"
-    return True
+    elif memory.heal_priority_interleave_pending:
+        memory.core_visit_forced_purpose = None
+    return intent_id in ready_candidate_ids
 
 
 def _admit_healing_defender(
@@ -4726,12 +5019,22 @@ def _refresh_cargo_lane_occupants(
         for worker in workers
         if str(getattr(worker, "id", ""))
     }
+    living_defender_ids = {
+        str(getattr(unit, "id", ""))
+        for unit in getattr(turn, "units", ())
+        if _enum_label(getattr(unit, "unit_type", ""))
+        in {"VANGUARD", "RANGER"}
+        and str(getattr(unit, "id", ""))
+    }
+    lane.core_release_hold_unit_ids.intersection_update(living_defender_ids)
     core_neighbors = {
         _next_position(lane.core_position, direction)
         for direction in CARDINAL_DIRECTIONS
     }
     owner = workers_by_id.get(lane.owner_id or "")
     owner_position = _position(getattr(owner, "position", None))
+    if owner_position == lane.core_position:
+        lane.core_release_hold_unit_ids.clear()
     owner_approach_path: tuple[Position, ...] = ()
     if (
         lane.phase in {"INBOUND", "DEPOSIT"}
@@ -4746,7 +5049,7 @@ def _refresh_cargo_lane_occupants(
         )
         if owner_route.status == "SUCCESS":
             owner_approach_path = tuple(
-                owner_route.path[-(CARGO_LANE_GATEWAY_STEPS + 1) :]
+                owner_route.path[: CARGO_LANE_OWNER_ADMISSION_STEPS + 1]
             )
     lane.owner_approach_path = owner_approach_path
     owner_approach_positions = set(owner_approach_path)
@@ -4776,6 +5079,15 @@ def _refresh_cargo_lane_occupants(
         | owner_approach_positions
         | set(heal_approach_path)
     )
+    if memory.healing_defender_admitted_id is not None:
+        # A blocker beside the healing route can pin the next blocker on the
+        # route itself. Include the route's one-cell neighborhood so the
+        # clearance planner can form a deterministic yield chain.
+        for position in heal_approach_path:
+            staging_exclusions.update(
+                _next_position(position, direction)
+                for direction in CARDINAL_DIRECTIONS
+            )
     queued_owner = workers_by_id.get(lane.queued_owner_id or "")
     queued_owner_has_cargo = bool(
         queued_owner is not None and int(getattr(queued_owner, "cargo", 0)) > 0
@@ -4813,13 +5125,91 @@ def _refresh_cargo_lane_occupants(
         for unit in getattr(turn, "units", ())
         if _enum_label(getattr(unit, "unit_type", ""))
         in {"VANGUARD", "RANGER"}
-        and _position(getattr(unit, "position", None)) in staging_exclusions
+        and _position(getattr(unit, "position", None))
+        in staging_exclusions | core_neighbors
         and str(getattr(unit, "id", ""))
         != memory.healing_defender_admitted_id
         and not (
             memory.core_visit.purpose == "HEAL"
             and str(getattr(unit, "id", "")) == memory.core_visit.unit_id
         )
+    } | lane.core_release_hold_unit_ids
+    yielding_ids = lane.yield_worker_ids | lane.yield_unit_ids
+    units_by_id = {
+        str(getattr(unit, "id", "")): unit
+        for unit in getattr(turn, "units", ())
+        if str(getattr(unit, "id", "")) in yielding_ids
+    }
+    clearance_positions = staging_exclusions | core_neighbors
+    unavailable_positions = set(friendly_occupancy)
+    unavailable_positions.update(
+        _positions(getattr(turn, "resource_cells", ()))
+    )
+    reserved_yield_positions: set[Position] = set()
+    yield_paths: dict[str, tuple[Position, ...]] = {}
+    for unit_id, unit in sorted(
+        units_by_id.items(),
+        key=lambda item: (
+            -_manhattan(
+                _position(getattr(item[1], "position", None))
+                or lane.core_position,
+                lane.core_position,
+            ),
+            item[0],
+        ),
+    ):
+        origin = _position(getattr(unit, "position", None))
+        if origin is None:
+            continue
+        route = _cargo_lane_yield_route(
+            origin,
+            lane.core_position,
+            clearance_positions,
+            blocked | danger_cells,
+            unavailable_positions | reserved_yield_positions,
+        )
+        if (
+            route is not None
+            and origin == lane.core_position
+            and lane.owner_id is not None
+        ):
+            # Keep a Core occupant on its published release route until the
+            # admitted Cargo owner takes the Core. Otherwise guard assignment
+            # can send it straight back and contest the deposit cell.
+            lane.core_release_hold_unit_ids.add(unit_id)
+        if route is None:
+            # A closed pocket can leave a defender standing on the Core with
+            # no route all the way beyond the clearance ring. Moving it to an
+            # adjacent non-lane cell is still enough to release the deposit
+            # cell for the admitted Cargo owner on the next Tick.
+            route = _cargo_lane_core_release_route(
+                origin,
+                lane,
+                blocked | danger_cells,
+                unavailable_positions | reserved_yield_positions,
+            )
+            if route is not None:
+                lane.core_release_hold_unit_ids.add(unit_id)
+        if route is None:
+            route = _cargo_lane_temporary_release_route(
+                origin,
+                lane,
+                owner_approach_positions,
+                blocked | danger_cells,
+                unavailable_positions,
+                reserved_yield_positions,
+                held=unit_id in lane.core_release_hold_unit_ids,
+            )
+            if route is not None:
+                lane.core_release_hold_unit_ids.add(unit_id)
+        if route is None:
+            continue
+        yield_paths[unit_id] = route
+        reserved_yield_positions.update(route[1:])
+    lane.yield_paths = yield_paths
+    lane.yield_targets = {
+        unit_id: route[-1]
+        for unit_id, route in yield_paths.items()
     }
     staged_cargo = [
         worker
@@ -4943,10 +5333,7 @@ def _update_cargo_lane(
                 return lane
         if not core_accepts_delivery:
             return lane
-        if (
-            healing_priority_ready
-            and memory.core_visit_forced_purpose == "HEAL"
-        ):
+        if memory.core_visit_forced_purpose == "HEAL":
             return lane
         single_path = _single_open_cargo_lane_path(
             core_position,
@@ -5023,7 +5410,14 @@ def _update_cargo_lane(
             )
 
     if memory.core_visit.unit_id is None:
-        if not healing_priority_ready:
+        if (
+            not healing_priority_ready
+            and (
+                memory.heal_priority_intent_id is None
+                or memory.core_visit_deposit_streak < HEAL_PRIORITY_DEPOSIT_LIMIT
+                or memory.heal_priority_interleave_pending
+            )
+        ):
             memory.core_visit_forced_purpose = None
         deposit_worker = workers_by_id.get(memory.cargo_lane.owner_id or "")
         if (
@@ -5091,6 +5485,7 @@ def _update_cargo_lane(
     stalled_inbound_owner_id: str | None = None
     if owner is not None and not owner_has_cargo:
         departing_id = str(getattr(owner, "id", ""))
+        memory.cargo_lane_stalled_owners.pop(departing_id, None)
         lane.departing_worker_id = departing_id
         lane.owner_id = None
         _set_cargo_lane_phase(lane, "EGRESS", tick)
@@ -5119,6 +5514,11 @@ def _update_cargo_lane(
             # Once it enters lane.path, preserving half-duplex ownership takes
             # precedence over watchdog recovery.
             stalled_inbound_owner_id = lane.owner_id
+            if stalled_inbound_owner_id and owner_position is not None:
+                memory.cargo_lane_stalled_owners[stalled_inbound_owner_id] = (
+                    owner_position,
+                    tick + CARGO_LANE_STALLED_OWNER_COOLDOWN_TICKS,
+                )
             lane.watchdog_reason = "INBOUND_OWNER_STALLED"
             lane.owner_id = None
             lane.owner_approach_path = ()
@@ -5235,15 +5635,12 @@ def _update_cargo_lane(
             lane.phase == "EGRESS"
             and queued_owner_valid
             and memory.core_visit.unit_id is None
-            and memory.core_visit_forced_purpose == "HEAL"
+            and memory.heal_priority_interleave_pending
             and memory.healing_defender_admitted_id is None
-            and tick - lane.phase_started_tick
-            >= CARGO_LANE_EGRESS_WATCHDOG_TICKS
         ):
             memory.core_visit_forced_purpose = None
-            memory.core_visit_deposit_streak = 0
             lane.watchdog_tick = tick
-            lane.watchdog_reason = "EGRESS_HANDOFF_TIMEOUT"
+            lane.watchdog_reason = "HEAL_PRIORITY_INTERLEAVE"
         if (
             lane.owner_id is None
             and cargo_workers
@@ -5784,6 +6181,7 @@ def _clear_defender_heal_admission(
     memory: TacticMemory,
     *,
     clear_intent: bool,
+    clear_priority: bool = True,
 ) -> None:
     admitted_id = memory.healing_defender_admitted_id
     memory.healing_defender_admitted_id = None
@@ -5793,13 +6191,16 @@ def _clear_defender_heal_admission(
     memory.healing_defender_last_position = None
     memory.cargo_lane.heal_approach_path = ()
     if clear_intent:
-        if memory.heal_priority_intent_id in {
+        if clear_priority and memory.heal_priority_intent_id in {
             admitted_id,
             memory.healing_defender_intent_id,
         }:
             memory.heal_priority_intent_id = None
             memory.core_visit_forced_purpose = None
             memory.core_visit_deposit_streak = 0
+            memory.heal_priority_started_tick = -1
+            memory.heal_priority_admission_timeouts = 0
+            memory.heal_priority_interleave_pending = False
         memory.healing_defender_intent_id = None
         memory.healing_defender_intent_tick = -1
         memory.healing_defender_stage_target = None
@@ -5858,6 +6259,11 @@ def _refresh_healing_defenders(
         memory.healing_defender_intent_id = min(candidates)[2]
         memory.healing_defender_intent_tick = tick
         memory.healing_defender_stage_target = None
+        if (
+            memory.heal_priority_intent_id is not None
+            and memory.core_visit_deposit_streak >= HEAL_PRIORITY_DEPOSIT_LIMIT
+        ):
+            memory.heal_priority_intent_id = memory.healing_defender_intent_id
 
     admitted_id = memory.healing_defender_admitted_id
     admitted = defenders_by_id.get(admitted_id or "")
@@ -5886,7 +6292,30 @@ def _refresh_healing_defenders(
         memory.healing_defender_cooldowns[admitted_id] = (
             tick + DEFENDER_HEAL_COOLDOWN_TICKS
         )
-        _clear_defender_heal_admission(memory, clear_intent=True)
+        memory.healing_defender_timeout_tick = tick
+        memory.heal_priority_admission_timeouts += 1
+        _clear_defender_heal_admission(
+            memory,
+            clear_intent=True,
+            clear_priority=False,
+        )
+        remaining_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate[2] != admitted_id
+        ]
+        if remaining_candidates:
+            memory.healing_defender_intent_id = min(remaining_candidates)[2]
+            memory.healing_defender_intent_tick = tick
+            memory.heal_priority_intent_id = memory.healing_defender_intent_id
+            memory.core_visit_forced_purpose = "HEAL"
+        else:
+            memory.heal_priority_intent_id = None
+            memory.core_visit_forced_purpose = None
+            memory.core_visit_deposit_streak = 0
+            memory.heal_priority_started_tick = -1
+            memory.heal_priority_admission_timeouts = 0
+            memory.heal_priority_interleave_pending = False
 
 
 def _refresh_healing_workers(
@@ -6986,6 +7415,154 @@ def _core_lane_outward_direction(
     return max(candidates, key=lambda candidate: candidate[0])[1]
 
 
+def _cargo_lane_yield_route(
+    origin: Position,
+    core_position: Position,
+    clearance_positions: set[Position],
+    blocked: set[Position],
+    unavailable: set[Position],
+) -> tuple[Position, ...] | None:
+    search_blocked = set(blocked) | set(unavailable) | {core_position}
+    search_blocked.discard(origin)
+    frontier = deque((origin,))
+    parents: dict[Position, Position] = {}
+    distances = {origin: 0}
+    candidates: list[tuple[int, int, int, int, int, Position]] = []
+    current_core_distance = _manhattan(origin, core_position)
+    while frontier:
+        current = frontier.popleft()
+        for direction in CARDINAL_DIRECTIONS:
+            destination = _next_position(current, direction)
+            if destination in distances or destination in search_blocked:
+                continue
+            distance_from_origin = distances[current] + 1
+            if distance_from_origin > CARGO_LANE_OWNER_ADMISSION_STEPS:
+                continue
+            distances[destination] = distance_from_origin
+            parents[destination] = current
+            if destination not in clearance_positions:
+                core_distance = _manhattan(destination, core_position)
+                candidates.append(
+                    (
+                        distance_from_origin,
+                        int(core_distance < current_core_distance),
+                        -core_distance,
+                        destination[0],
+                        destination[1],
+                        destination,
+                    )
+                )
+                continue
+            frontier.append(destination)
+    if not candidates:
+        return None
+    target = min(candidates)[-1]
+    path = [target]
+    while path[-1] != origin:
+        path.append(parents[path[-1]])
+    path.reverse()
+    return tuple(path)
+
+
+def _cargo_lane_core_release_route(
+    origin: Position,
+    lane: CargoLanePlan,
+    blocked: set[Position],
+    unavailable: set[Position],
+) -> tuple[Position, ...] | None:
+    """Free an occupied Core cell when a closed pocket has no full yield route."""
+
+    if lane.core_position is None or origin != lane.core_position:
+        return None
+    protected_positions = (
+        set(lane.path)
+        | set(lane.owner_approach_path)
+        | set(lane.heal_approach_path)
+    )
+    candidates = [
+        _next_position(origin, direction)
+        for direction in CARDINAL_DIRECTIONS
+        if _next_position(origin, direction) not in protected_positions
+        and _next_position(origin, direction) not in blocked
+        and _next_position(origin, direction) not in unavailable
+    ]
+    if not candidates:
+        return None
+    return origin, min(candidates)
+
+
+def _cargo_lane_temporary_release_route(
+    origin: Position,
+    lane: CargoLanePlan,
+    owner_approach_positions: set[Position],
+    blocked: set[Position],
+    unavailable: set[Position],
+    reserved: set[Position],
+    *,
+    held: bool = False,
+) -> tuple[Position, ...] | None:
+    """Move a corridor blocker one cell aside when the pocket has no exit."""
+
+    if lane.core_position is None or origin == lane.core_position:
+        return None
+    protected_positions = set(lane.path)
+    if not held and origin not in owner_approach_positions and origin not in {
+        _next_position(lane.core_position, direction)
+        for direction in CARDINAL_DIRECTIONS
+    }:
+        return None
+    candidates = []
+    for index, direction in enumerate(CARDINAL_DIRECTIONS):
+        destination = _next_position(origin, direction)
+        if (
+            destination in protected_positions
+            or destination in blocked
+            or destination in unavailable
+            or destination in reserved
+        ):
+            continue
+        candidates.append(
+            (
+                int(destination not in owner_approach_positions),
+                int(destination not in {
+                    _next_position(lane.core_position, neighbor_direction)
+                    for neighbor_direction in CARDINAL_DIRECTIONS
+                }),
+                _manhattan(destination, lane.core_position),
+                -index,
+                destination,
+            )
+        )
+    if not candidates:
+        return None
+    return origin, max(candidates)[-1]
+
+
+def _cargo_lane_assigned_yield_destination(
+    unit_id: str,
+    origin: Position,
+    lane: CargoLanePlan,
+    blocked: set[Position],
+    reservations: Any,
+    friendly_occupancy: dict[Position, int],
+) -> Position | None:
+    route = lane.yield_paths.get(unit_id, ())
+    if origin not in route:
+        return None
+    path_index = route.index(origin)
+    if path_index + 1 >= len(route):
+        return None
+    destination = route[path_index + 1]
+    capacity_blocked = _unit_capacity_blocked(
+        friendly_occupancy,
+        reservations,
+        actor_origin=origin,
+    )
+    if destination in blocked or destination in capacity_blocked:
+        return None
+    return destination
+
+
 def _cargo_lane_yield_direction(
     origin: Position,
     core_position: Position,
@@ -7058,6 +7635,28 @@ def _queue_cargo_lane_owner_step(
     if origin is None or not worker_id or lane.gateway is None:
         return False
     if origin not in lane.path:
+        if lane.owner_approach_path and origin in lane.owner_approach_path:
+            path_index = lane.owner_approach_path.index(origin)
+            if path_index + 1 < len(lane.owner_approach_path):
+                destination = lane.owner_approach_path[path_index + 1]
+                capacity_blocked = _unit_capacity_blocked(
+                    friendly_occupancy,
+                    reservations,
+                    actor_origin=origin,
+                )
+                if destination not in blocked and destination not in capacity_blocked:
+                    direction = _direction_between(origin, destination)
+                    if direction is not None:
+                        _reserve_destination(reservations, destination)
+                        worker.move(direction)
+                        memory.note_worker_move(worker_id, destination)
+                        return True
+                memory.route_diagnostics[worker_id] = (
+                    "CAPACITY_BLOCKED"
+                    if destination in capacity_blocked
+                    else "CARGO_LANE_BLOCKED"
+                )
+                return False
         moved, _, _ = _queue_worker_route(
             worker,
             lane.gateway,
@@ -7151,20 +7750,42 @@ def _queue_cargo_lane_defender_yield(
         or lane.core_position is None
     ):
         return False
-    direction = _cargo_lane_yield_direction(
+    destination = _cargo_lane_assigned_yield_destination(
+        unit_id,
         origin,
-        lane.core_position,
-        set(lane.path)
-        | set(lane.owner_approach_path)
-        | set(lane.heal_approach_path)
-        | set(lane.egress_path),
+        lane,
         blocked,
         reservations,
         friendly_occupancy,
     )
-    if direction is None:
+    direction = (
+        _direction_between(origin, destination)
+        if destination is not None
+        else None
+    )
+    if destination is None or direction is None:
+        # A dense Core pocket may have no complete route to an open component.
+        # Release one corridor cell first so the admitted healer can advance;
+        # the next Tick will republish a complete route after occupancy clears.
+        protected_positions = (
+            set(lane.path)
+            | set(lane.egress_path)
+            | set(lane.owner_approach_path)
+            | set(lane.heal_approach_path)
+        )
+        fallback_direction = _cargo_lane_yield_direction(
+            origin,
+            lane.core_position,
+            protected_positions,
+            blocked,
+            reservations,
+            friendly_occupancy,
+        )
+        if fallback_direction is not None:
+            destination = _next_position(origin, fallback_direction)
+            direction = fallback_direction
+    if destination is None or direction is None:
         return False
-    destination = _next_position(origin, direction)
     _reserve_destination(reservations, destination)
     memory.note_unit_move(unit_id, destination, destination, None)
     unit.move(direction)
@@ -7559,16 +8180,20 @@ def _plan_workers(
             and worker_key in lane.yield_worker_ids
             and worker_position is not None
         ):
-            direction = _cargo_lane_yield_direction(
+            destination = _cargo_lane_assigned_yield_destination(
+                worker_key,
                 worker_position,
-                lane.core_position,
-                set(lane.path) | set(lane.egress_path),
+                lane,
                 worker_return_blocked | contested_positions,
                 reserved_destinations,
                 friendly_occupancy,
             )
-            if direction is not None:
-                destination = _next_position(worker_position, direction)
+            direction = (
+                _direction_between(worker_position, destination)
+                if destination is not None
+                else None
+            )
+            if destination is not None and direction is not None:
                 _reserve_destination(reserved_destinations, destination)
                 worker.move(direction)
                 memory.note_worker_move(worker_key, destination)
@@ -8187,6 +8812,19 @@ def _queue_healing_defender_action(
         return True
 
     stage_target = memory.healing_defender_stage_target
+    if (
+        core_position is not None
+        and _chebyshev(origin, core_position) <= max(CARGO_LANE_STAGE_RADII)
+        and _complete_route(origin, core_position, movement_blocked).status
+        == "SUCCESS"
+        and memory.heal_priority_intent_id == unit_id
+        and (
+            memory.core_visit_deposit_streak >= HEAL_PRIORITY_DEPOSIT_LIMIT
+            or memory.core_visit_forced_purpose == "HEAL"
+        )
+    ):
+        unit.wait()
+        return True
     if origin == stage_target:
         unit.wait()
         return True
@@ -8229,7 +8867,19 @@ def _plan_vanguards(
     movement_blocked = blocked | danger_cells | enemy_occupied_positions
     tick = int(getattr(turn, "tick", 0))
     for slot, vanguard in enumerate(
-        sorted(getattr(turn, "vanguards", ()), key=lambda unit: str(unit.id))
+        sorted(
+            getattr(turn, "vanguards", ()),
+            key=lambda unit: (
+                0
+                if str(getattr(unit, "id", ""))
+                in memory.cargo_lane.yield_unit_ids
+                else 1
+                if str(getattr(unit, "id", ""))
+                == memory.healing_defender_admitted_id
+                else 2,
+                str(getattr(unit, "id", "")),
+            ),
+        )
     ):
         origin = _position(getattr(vanguard, "position", None))
         if origin is None:
@@ -8424,7 +9074,19 @@ def _plan_rangers(
     movement_blocked = blocked | danger_cells | enemy_occupied_positions
     tick = int(getattr(turn, "tick", 0))
     for slot, ranger in enumerate(
-        sorted(getattr(turn, "rangers", ()), key=lambda unit: str(unit.id))
+        sorted(
+            getattr(turn, "rangers", ()),
+            key=lambda unit: (
+                0
+                if str(getattr(unit, "id", ""))
+                in memory.cargo_lane.yield_unit_ids
+                else 1
+                if str(getattr(unit, "id", ""))
+                == memory.healing_defender_admitted_id
+                else 2,
+                str(getattr(unit, "id", "")),
+            ),
+        )
     ):
         origin = _position(getattr(ranger, "position", None))
         if origin is None:
@@ -9041,6 +9703,12 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         str(getattr(unit, "id", "")) in raid_ids
         for unit in getattr(turn, "rangers", ())
     )
+    lane = memory.cargo_lane
+    heal_priority_wait_ticks = (
+        max(0, int(turn.tick) - memory.heal_priority_started_tick)
+        if memory.heal_priority_started_tick >= 0
+        else 0
+    )
 
     return PlanReport(
         tick=int(turn.tick),
@@ -9070,6 +9738,14 @@ def plan_turn(turn: Any, memory: TacticMemory, config: AgentConfig) -> PlanRepor
         ranger_defenders=len(tuple(defending_rangers)),
         ranger_raid=ranger_raid,
         ranger_attacks=ranger_attacks,
+        cargo_lane_phase=lane.phase if lane.active else "IDLE",
+        cargo_lane_yield_workers=len(lane.yield_worker_ids),
+        cargo_lane_yield_units=len(lane.yield_unit_ids),
+        cargo_watchdog_reason=lane.watchdog_reason,
+        heal_priority_active=memory.heal_priority_intent_id is not None,
+        healing_defender_admitted=memory.healing_defender_admitted_id is not None,
+        heal_priority_wait_ticks=heal_priority_wait_ticks,
+        heal_priority_interleave_pending=memory.heal_priority_interleave_pending,
     )
 
 
@@ -9156,6 +9832,7 @@ def _submit_turn_with_retry(
     *,
     attempts: int = SUBMIT_RETRY_ATTEMPTS,
     sleep_fn: Any = time.sleep,
+    error_callback: Any = None,
 ) -> Any:
     """Retry one Tick with the same process-session idempotency key."""
 
@@ -9165,6 +9842,8 @@ def _submit_turn_with_retry(
         try:
             return turn.submit(idempotency_key=idempotency_key)
         except TransportError:
+            if error_callback is not None:
+                error_callback("submit_transport")
             if attempt + 1 >= attempts:
                 raise
             delay = SUBMIT_RETRY_BASE_DELAY_SECONDS * (2**attempt)
@@ -9175,6 +9854,8 @@ def _submit_turn_with_retry(
             )
             sleep_fn(delay)
         except APIError as exc:
+            if error_callback is not None:
+                error_callback("submit_api")
             if not _is_retryable_api_error(exc):
                 raise
             if attempt + 1 >= attempts:
@@ -9591,6 +10272,11 @@ def main(argv: list[str] | None = None) -> int:
                         accepted = _submit_turn_with_retry(
                             turn,
                             attempts=max(1, args.submit_retries),
+                            error_callback=(
+                                recorder.record_runtime_error
+                                if recorder is not None
+                                else None
+                            ),
                         )
                         submitted_turns += 1
                         reconnect_attempt = 0
@@ -9609,6 +10295,8 @@ def main(argv: list[str] | None = None) -> int:
             except ProtocolError as exc:
                 if not _is_retryable_protocol_error(exc):
                     raise
+                if recorder is not None:
+                    recorder.record_runtime_error("reconnect_protocol")
                 reconnect_attempt += 1
                 if reconnect_attempt > max_reconnect_attempts:
                     LOGGER.error(
@@ -9626,6 +10314,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 time.sleep(delay)
             except APIError as exc:
+                if recorder is not None:
+                    recorder.record_runtime_error("reconnect_api")
                 if not _is_retryable_api_error(exc):
                     _log_api_error("Agent 因不可重试 API 错误停止", exc)
                     return 4
@@ -9644,6 +10334,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 time.sleep(delay)
             except TransportError as exc:
+                if recorder is not None:
+                    recorder.record_runtime_error("reconnect_transport")
                 reconnect_attempt += 1
                 if reconnect_attempt > max_reconnect_attempts:
                     LOGGER.error(

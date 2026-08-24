@@ -10,6 +10,7 @@ from arena_agent import (
     AgentConfig,
     EnemyMotion,
     PlanReport,
+    SessionStats,
     ScoutProgress,
     ScoutReturnProgress,
     SessionRecorder,
@@ -17,6 +18,8 @@ from arena_agent import (
     UnitType,
     CORE_TARGET_MEMORY_TTL,
     CARGO_LANE_INBOUND_WATCHDOG_TICKS,
+    CRITICAL_DEFENDER_HEAL_MAX_WAIT_TICKS,
+    HEAL_PRIORITY_MAX_HOLD_TICKS,
     IDLE_ASSIGNMENT_COST,
     PATH_COST_UNREACHABLE,
     ROUTE_MAX_EXPANSIONS,
@@ -34,6 +37,9 @@ from arena_agent import (
     _complete_route,
     _cargo_lane_egress_complete,
     _cargo_lane_egress_route,
+    _cargo_lane_yield_direction,
+    _queue_cargo_lane_defender_yield,
+    _cargo_lane_temporary_release_route,
     _cargo_lane_startup_workers,
     _core_escape_direction,
     _friendly_cell_occupancy,
@@ -406,31 +412,37 @@ class ArenaAgentTests(unittest.TestCase):
 
     def test_transport_retry_reuses_idempotency_key(self):
         turn = FlakyTurn()
+        errors = []
 
         result = _submit_turn_with_retry(
             turn,
             attempts=2,
             sleep_fn=lambda _: None,
+            error_callback=errors.append,
         )
 
         self.assertEqual(result, "accepted")
         self.assertEqual(turn.calls[0], turn.calls[1])
         self.assertTrue(turn.calls[0].startswith("arena-agent-"))
         self.assertTrue(turn.calls[0].endswith("-42"))
+        self.assertEqual(errors, ["submit_transport"])
 
     def test_retryable_api_error_reuses_idempotency_key(self):
         turn = RetryableApiTurn()
+        errors = []
 
         result = _submit_turn_with_retry(
             turn,
             attempts=2,
             sleep_fn=lambda _: None,
+            error_callback=errors.append,
         )
 
         self.assertEqual(result, "accepted")
         self.assertEqual(turn.calls[0], turn.calls[1])
         self.assertTrue(turn.calls[0].startswith("arena-agent-"))
         self.assertTrue(turn.calls[0].endswith("-43"))
+        self.assertEqual(errors, ["submit_api"])
 
     def test_permanent_api_error_is_not_retried(self):
         turn = PermanentApiTurn()
@@ -561,6 +573,7 @@ class ArenaAgentTests(unittest.TestCase):
             stats_path = Path(directory) / "stats.json"
             recorder = SessionRecorder(str(trace_path), str(stats_path))
             recorder.record_turn(turn, report, True, memory)
+            recorder.record_runtime_error("submit_transport")
             recorder.close()
             trace = json.loads(trace_path.read_text(encoding="utf-8").strip())
             stats = json.loads(stats_path.read_text(encoding="utf-8"))
@@ -582,6 +595,55 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertEqual(stats["ticks"], 1)
         self.assertEqual(stats["accepted_ticks"], 1)
         self.assertEqual(stats["mission_counts"], {"SCOUT": 1})
+        self.assertEqual(stats["current_injured_units"], 0)
+        self.assertEqual(stats["max_deposit_gap_ticks"], 0)
+        self.assertEqual(stats["cargo_watchdog_counts"], {})
+        self.assertEqual(stats["runtime_error_counts"], {"submit_transport": 1})
+
+    def test_session_stats_tracks_logistics_healing_and_network_metrics(self):
+        worker = FakeActor("worker", (0, 0), cargo=0)
+        worker.hp = 1
+        ranger = FakeActor("ranger", (2, 0), unit_type=UnitType.RANGER)
+        ranger.hp = 1
+        core = FakeActor("core", (0, 0), shield=5)
+        turn = make_turn(worker=worker, core=core)
+        turn.workers = (worker,)
+        turn.rangers = (ranger,)
+        turn.units = (worker, ranger)
+        turn.events = (SimpleNamespace(event_type="DEPOSIT_SUCCEEDED"),)
+        memory = TacticMemory(
+            heal_priority_started_tick=5,
+            healing_defender_timeout_tick=10,
+            cargo_lane=CargoLanePlan(
+                active=True,
+                phase="INBOUND",
+                watchdog_tick=10,
+                watchdog_reason="INBOUND_OWNER_STALLED",
+            ),
+        )
+        stats = SessionStats("test-session")
+        stats.record(turn, PlanReport(10, 0, 2, 1, 0, 1, 0, 0, 0), True, memory)
+
+        turn.tick = 18
+        turn.events = (SimpleNamespace(event_type="DEPOSIT_SUCCEEDED"),)
+        memory.cargo_lane.watchdog_tick = -1
+        stats.record(turn, PlanReport(18, 0, 2, 1, 0, 1, 0, 0, 0), True, memory)
+        stats.record_runtime_error("reconnect_transport")
+
+        payload = stats.as_dict()
+        self.assertEqual(payload["max_deposit_gap_ticks"], 8)
+        self.assertEqual(payload["current_injured_units"], 2)
+        self.assertEqual(payload["max_injured_units"], 2)
+        self.assertEqual(payload["max_heal_priority_wait_ticks"], 13)
+        self.assertEqual(payload["healing_admission_timeouts"], 1)
+        self.assertEqual(
+            payload["cargo_watchdog_counts"],
+            {"INBOUND_OWNER_STALLED": 1},
+        )
+        self.assertEqual(
+            payload["runtime_error_counts"],
+            {"reconnect_transport": 1},
+        )
 
     def test_trace_event_keeps_move_failure_identity_and_position(self):
         event = SimpleNamespace(
@@ -3924,7 +3986,7 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertIsNone(memory.heal_priority_intent_id)
         self.assertIsNone(memory.core_visit_forced_purpose)
 
-    def test_egress_watchdog_releases_stale_heal_priority(self):
+    def test_heal_priority_bound_interleaves_one_cargo_without_losing_quota(self):
         queued = FakeActor("queued", (3, 1), cargo=1)
         healer = FakeActor("healer", (4, 1), cargo=0)
         healer.hp = 1
@@ -3932,7 +3994,7 @@ class ArenaAgentTests(unittest.TestCase):
         core.hp = 5
         blocked = {(0, -1), (-1, 0), (0, 1)}
         turn = make_turn(worker=queued, core=core, obstacles=frozenset(blocked))
-        turn.tick = 30
+        turn.tick = 33
         turn.workers = (queued, healer)
         turn.units = turn.workers
         turn.state.population = len(turn.units)
@@ -3943,6 +4005,9 @@ class ArenaAgentTests(unittest.TestCase):
             heal_intent_tick=turn.tick,
             heal_intent_best_distance=5,
             heal_priority_intent_id="healer",
+            heal_priority_started_tick=(
+                1
+            ),
             core_visit_deposit_streak=3,
             core_visit_forced_purpose="HEAL",
             cargo_lane=CargoLanePlan(
@@ -3976,9 +4041,11 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertEqual(memory.cargo_lane.watchdog_tick, turn.tick)
         self.assertEqual(
             memory.cargo_lane.watchdog_reason,
-            "EGRESS_HANDOFF_TIMEOUT",
+            "HEAL_PRIORITY_INTERLEAVE",
         )
-        self.assertEqual(memory.core_visit_deposit_streak, 0)
+        self.assertEqual(memory.core_visit_deposit_streak, 3)
+        self.assertEqual(memory.heal_priority_intent_id, "healer")
+        self.assertTrue(memory.heal_priority_interleave_pending)
         self.assertIsNone(memory.core_visit_forced_purpose)
 
     def test_cargo_lane_phase_start_tick_changes_at_each_handoff(self):
@@ -4283,6 +4350,62 @@ class ArenaAgentTests(unittest.TestCase):
             {"vanguard", "ranger"},
         )
 
+    def test_inbound_owner_approach_starts_at_owner_not_gateway_suffix(self):
+        owner = FakeActor("owner", (10, 0), cargo=1)
+        early_blocker = FakeActor(
+            "early-blocker",
+            (9, 0),
+            unit_type=UnitType.VANGUARD,
+        )
+        early_blocker.hp = 4
+        late_blocker = FakeActor(
+            "late-blocker",
+            (5, 0),
+            unit_type=UnitType.RANGER,
+        )
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        blocked = {(0, -1), (-1, 0), (0, 1)}
+        turn = make_turn(worker=owner, core=core, obstacles=frozenset(blocked))
+        turn.vanguards = (early_blocker,)
+        turn.rangers = (late_blocker,)
+        turn.units = (owner, early_blocker, late_blocker)
+        turn.state.population = len(turn.units)
+        memory = TacticMemory(
+            cargo_lane=CargoLanePlan(
+                active=True,
+                phase="INBOUND",
+                core_position=(0, 0),
+                owner_id="owner",
+                path=((0, 0), (1, 0), (2, 0), (3, 0)),
+                gateway=(3, 0),
+                started_tick=turn.tick,
+                phase_started_tick=turn.tick,
+                geometry_source="SINGLE_OPEN",
+            )
+        )
+
+        _update_cargo_lane(
+            turn,
+            (0, 0),
+            blocked,
+            set(),
+            _friendly_cell_occupancy(turn),
+            memory,
+            core_accepts_delivery=True,
+            core_stable=True,
+            threat_level="NORMAL",
+        )
+
+        self.assertEqual(
+            memory.cargo_lane.owner_approach_path,
+            tuple((x, 0) for x in range(10, 2, -1)),
+        )
+        self.assertEqual(
+            memory.cargo_lane.yield_unit_ids,
+            {"early-blocker", "late-blocker"},
+        )
+
     def test_inbound_approach_defenders_yield_then_owner_progresses(self):
         owner = FakeActor("owner", (6, 0), cargo=1)
         vanguard = FakeActor("vanguard", (5, 0), unit_type=UnitType.VANGUARD)
@@ -4385,6 +4508,35 @@ class ArenaAgentTests(unittest.TestCase):
             memory.cargo_lane.watchdog_reason,
             "INBOUND_OWNER_STALLED",
         )
+        self.assertEqual(
+            memory.cargo_lane_stalled_owners["owner"][0],
+            owner.position,
+        )
+
+    def test_stalled_owner_cooldown_prefers_alternative_until_owner_moves(self):
+        stalled = FakeActor("stalled", (4, 0), cargo=1)
+        alternative = FakeActor("alternative", (7, 0), cargo=1)
+        memory = TacticMemory(
+            last_observed_tick=10,
+            cargo_lane_stalled_owners={"stalled": ((4, 0), 26)},
+        )
+
+        owner, _ = _select_cargo_lane_owner(
+            (stalled, alternative),
+            (3, 0),
+            set(),
+            memory,
+        )
+        self.assertEqual(owner.id, "alternative")
+
+        stalled.position = (5, 0)
+        owner, _ = _select_cargo_lane_owner(
+            (stalled, alternative),
+            (3, 0),
+            set(),
+            memory,
+        )
+        self.assertEqual(owner.id, "stalled")
 
     def test_inbound_watchdog_never_replaces_owner_inside_physical_lane(self):
         owner = FakeActor("owner", (2, 0), cargo=1)
@@ -4437,6 +4589,135 @@ class ArenaAgentTests(unittest.TestCase):
             memory.cargo_lane.watchdog_reason,
             "INBOUND_OWNER_STALLED_IN_LANE",
         )
+
+    def test_core_occupant_releases_closed_cargo_pocket_for_stalled_owner(self):
+        owner = FakeActor("owner", (-1, 0), cargo=1)
+        defender = FakeActor(
+            "defender",
+            (0, 0),
+            unit_type=UnitType.VANGUARD,
+        )
+        defender.hp = 4
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        # The only temporary release cell is immediately above the Core. It
+        # cannot become a normal yield target because it does not lead beyond
+        # the closed clearance ring.
+        blocked = frozenset({(1, 0), (0, 1), (-1, -1), (1, -1), (0, -2)})
+        turn = make_turn(worker=owner, core=core, obstacles=blocked)
+        turn.vanguards = (defender,)
+        turn.units = (owner, defender)
+        turn.state.population = len(turn.units)
+        memory = TacticMemory(
+            cargo_lane=CargoLanePlan(
+                active=True,
+                phase="INBOUND",
+                core_position=(0, 0),
+                owner_id="owner",
+                path=((0, 0), (-1, 0)),
+                gateway=(-1, 0),
+                started_tick=turn.tick,
+                phase_started_tick=turn.tick,
+                geometry_source="CORE_POCKET",
+            )
+        )
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(memory.cargo_lane.yield_targets["defender"], (0, -1))
+        self.assertEqual(defender.actions, [("MOVE", Direction.UP)])
+        self.assertEqual(owner.actions, [("WAIT",)])
+        apply_synchronous_actions(turn)
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(owner.actions, [("MOVE", Direction.RIGHT)])
+        self.assertEqual(defender.actions, [("WAIT",)])
+        self.assertIn(
+            "defender",
+            memory.cargo_lane.core_release_hold_unit_ids,
+        )
+        apply_synchronous_actions(turn)
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(owner.actions, [("DEPOSIT",)])
+        self.assertNotIn(
+            "defender",
+            memory.cargo_lane.core_release_hold_unit_ids,
+        )
+
+    def test_healed_ranger_stays_released_until_cargo_enters_core(self):
+        owner = FakeActor("owner", (0, -1), cargo=1)
+        healer = FakeActor("healer", (0, 0), unit_type=UnitType.RANGER)
+        healer.hp = 2
+        reserve = FakeActor("reserve", (5, 5), unit_type=UnitType.RANGER)
+        reserve.hp = 2
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        turn = make_turn(worker=owner, core=core)
+        turn.resources = 10
+        turn.resource_capacity = 30
+        turn.rangers = (healer, reserve)
+        turn.units = (owner, healer, reserve)
+        turn.state.population = len(turn.units)
+        memory = TacticMemory(
+            cargo_lane=CargoLanePlan(
+                active=True,
+                phase="INBOUND",
+                core_position=(0, 0),
+                owner_id="owner",
+                path=((0, 0), (0, -1)),
+                gateway=(0, -1),
+                started_tick=turn.tick,
+                phase_started_tick=turn.tick,
+                geometry_source="SINGLE_OPEN",
+            )
+        )
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(owner.actions, [("WAIT",)])
+        self.assertTrue(any(action[0] == "MOVE" for action in healer.actions))
+        self.assertIn("healer", memory.cargo_lane.core_release_hold_unit_ids)
+        apply_synchronous_actions(turn)
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(owner.actions, [("MOVE", Direction.DOWN)])
+        self.assertTrue(any(action[0] == "MOVE" for action in healer.actions))
+        self.assertIn("healer", memory.cargo_lane.core_release_hold_unit_ids)
+        apply_synchronous_actions(turn)
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(owner.actions, [("DEPOSIT",)])
+        self.assertNotIn("healer", memory.cargo_lane.core_release_hold_unit_ids)
+
+    def test_held_core_release_defender_can_continue_across_diagonal_pocket(self):
+        lane = CargoLanePlan(
+            active=True,
+            core_position=(-191, 680),
+            path=((-191, 680), (-191, 681), (-191, 682), (-191, 683)),
+            core_release_hold_unit_ids={"defender"},
+        )
+        route = _cargo_lane_temporary_release_route(
+            (-192, 681),
+            lane,
+            set(),
+            {
+                (-193, 681),
+                (-192, 679),
+                (-192, 682),
+                (-190, 679),
+                (-190, 680),
+                (-190, 681),
+            },
+            set(),
+            set(),
+            held=True,
+        )
+        self.assertEqual(route, ((-192, 681), (-192, 680)))
 
     def test_unadmitted_wounded_vanguard_yields_then_stages_outside_lane(self):
         cargo = FakeActor("cargo", (4, 0), cargo=1)
@@ -4707,6 +4988,156 @@ class ArenaAgentTests(unittest.TestCase):
 
         self.assertEqual(healer.actions, [("MOVE", Direction.RIGHT)])
 
+    def test_defender_yield_falls_back_to_one_cell_release_without_full_route(self):
+        blocker = FakeActor("blocker", (-187, 650), unit_type=UnitType.VANGUARD)
+        blocker.hp = 4
+        lane = CargoLanePlan(
+            active=True,
+            phase="EGRESS",
+            core_position=(-187, 647),
+            path=((-187, 647), (-187, 646), (-186, 646)),
+            gateway=(-186, 646),
+            heal_approach_path=(
+                (-186, 650),
+                (-187, 650),
+                (-187, 649),
+                (-187, 648),
+                (-187, 647),
+            ),
+            yield_unit_ids={"blocker"},
+        )
+        memory = TacticMemory(cargo_lane=lane)
+
+        moved = _queue_cargo_lane_defender_yield(
+            blocker,
+            lane,
+            blocked=set(),
+            reservations={},
+            friendly_occupancy={blocker.position: 1},
+            memory=memory,
+            tick=10,
+        )
+
+        self.assertTrue(moved)
+        self.assertEqual(blocker.actions, [("MOVE", Direction.DOWN)])
+
+    def test_admitted_heal_publishes_yield_for_adjacent_route_blocker(self):
+        queued = FakeActor("queued", (3, 0), cargo=1)
+        healer = FakeActor("healer", (0, 1), unit_type=UnitType.RANGER)
+        healer.hp = 1
+        blocker = FakeActor("blocker", (1, 1), unit_type=UnitType.VANGUARD)
+        blocker.hp = 4
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        turn = make_turn(worker=queued, core=core)
+        turn.resources = 20
+        turn.workers = (queued,)
+        turn.rangers = (healer,)
+        turn.vanguards = (blocker,)
+        turn.units = turn.workers + turn.rangers + turn.vanguards
+        turn.state.population = len(turn.units)
+        memory = TacticMemory(
+            healing_defender_ids={"healer"},
+            healing_defender_intent_id="healer",
+            healing_defender_admitted_id="healer",
+            heal_priority_intent_id="healer",
+            core_visit_forced_purpose="HEAL",
+            cargo_lane=CargoLanePlan(
+                active=True,
+                phase="EGRESS",
+                core_position=(0, 0),
+                queued_owner_id="queued",
+                path=((0, 0), (0, -1), (1, -1)),
+                gateway=(1, -1),
+            ),
+        )
+
+        _refresh_cargo_lane_occupants(
+            turn,
+            memory,
+            blocked=set(),
+            danger_cells=set(),
+            friendly_occupancy=_friendly_cell_occupancy(turn.units),
+        )
+
+        self.assertIn("blocker", memory.cargo_lane.yield_unit_ids)
+
+    def test_dense_healing_blocker_chain_clears_before_admission_timeout(self):
+        queued = FakeActor("queued", (2, 0), cargo=1)
+        healer = FakeActor("healer", (-5, 0), unit_type=UnitType.RANGER)
+        healer.hp = 1
+        blockers = tuple(
+            FakeActor(
+                f"blocker-{index}",
+                (-index, 0),
+                unit_type=UnitType.RANGER,
+            )
+            for index in range(1, 5)
+        )
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        turn = make_turn(worker=queued, core=core)
+        turn.resources = 20
+        turn.resource_capacity = 30
+        turn.workers = (queued,)
+        turn.rangers = (healer,) + blockers
+        turn.units = turn.workers + turn.rangers
+        turn.state.population = len(turn.units)
+        memory = TacticMemory(
+            healing_defender_ids={"healer"},
+            healing_defender_intent_id="healer",
+            healing_defender_intent_tick=turn.tick,
+            healing_defender_stage_target=healer.position,
+            healing_defender_admitted_id="healer",
+            healing_defender_admitted_tick=turn.tick,
+            healing_defender_best_distance=5,
+            healing_defender_last_progress_tick=turn.tick,
+            healing_defender_last_position=healer.position,
+            heal_priority_intent_id="healer",
+            heal_priority_started_tick=turn.tick,
+            core_visit_deposit_streak=3,
+            core_visit_forced_purpose="HEAL",
+            cargo_lane=CargoLanePlan(
+                active=True,
+                phase="EGRESS",
+                core_position=(0, 0),
+                queued_owner_id="queued",
+                path=((0, 0), (-1, 0), (-2, 0)),
+                gateway=(-2, 0),
+                started_tick=turn.tick,
+                phase_started_tick=turn.tick,
+                geometry_source="SINGLE_OPEN",
+            ),
+        )
+        history = []
+
+        for _ in range(12):
+            plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+            history.append(
+                (
+                    turn.tick,
+                    healer.position,
+                    tuple(blocker.position for blocker in blockers),
+                    dict(memory.cargo_lane.yield_targets),
+                    tuple(healer.actions),
+                )
+            )
+            if healer.actions == [("HEAL",)]:
+                break
+            apply_synchronous_actions(turn)
+
+        self.assertEqual(healer.actions, [("HEAL",)], f"history={history}")
+        self.assertLess(
+            turn.tick - memory.healing_defender_admitted_tick,
+            16,
+            f"history={history}",
+        )
+        self.assertNotIn("healer", memory.healing_defender_cooldowns)
+        self.assertTrue(
+            any(len(row[3]) == len(blockers) for row in history),
+            f"blockers lacked deterministic targets: history={history}",
+        )
+
     def test_defender_heal_waits_for_three_deposits_before_admission(self):
         queued = FakeActor("queued", (4, 1), cargo=1)
         healer = FakeActor("healer", (5, 0), unit_type=UnitType.VANGUARD)
@@ -4757,12 +5188,111 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertIsNone(at_quota.cargo_lane.owner_id)
         self.assertEqual(at_quota.core_visit_forced_purpose, "HEAL")
 
-    def test_stalled_defender_heal_admission_releases_cargo_handoff(self):
+    def test_critical_defender_wait_limit_preserves_one_cargo_delivery(self):
+        def run_case(unit_type, hp, deposit_streak):
+            queued = FakeActor("queued", (5, 0), cargo=1)
+            healer = FakeActor("healer", (4, 1), unit_type=unit_type)
+            healer.hp = hp
+            reserve = FakeActor("reserve", (6, 2), unit_type=unit_type)
+            reserve.hp = 4 if unit_type == UnitType.VANGUARD else 2
+            core = FakeActor("core", (0, 0), shield=5)
+            core.hp = 5
+            turn = make_turn(worker=queued, core=core)
+            turn.tick = 30
+            turn.resources = 20
+            turn.resource_capacity = 30
+            turn.workers = (queued,)
+            if unit_type == UnitType.VANGUARD:
+                turn.vanguards = (healer, reserve)
+            else:
+                turn.rangers = (healer, reserve)
+            turn.units = turn.workers + (healer, reserve)
+            turn.state.population = len(turn.units)
+            memory = TacticMemory(
+                healing_defender_ids={"healer"},
+                healing_defender_intent_id="healer",
+                healing_defender_intent_tick=(
+                    turn.tick - CRITICAL_DEFENDER_HEAL_MAX_WAIT_TICKS
+                ),
+                healing_defender_stage_target=healer.position,
+                heal_priority_intent_id="healer",
+                core_visit_deposit_streak=deposit_streak,
+                cargo_lane=CargoLanePlan(
+                    active=True,
+                    phase="EGRESS",
+                    core_position=(0, 0),
+                    queued_owner_id="queued",
+                    path=((0, 0), (1, 0), (2, 0), (3, 0)),
+                    gateway=(3, 0),
+                    started_tick=turn.tick - 5,
+                    phase_started_tick=turn.tick - 1,
+                    geometry_source="SINGLE_OPEN",
+                ),
+            )
+            plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+            return memory
+
+        before_delivery = run_case(UnitType.RANGER, 1, 0)
+        self.assertIsNone(before_delivery.healing_defender_admitted_id)
+        self.assertEqual(before_delivery.cargo_lane.owner_id, "queued")
+
+        after_delivery = run_case(UnitType.RANGER, 1, 1)
+        self.assertEqual(after_delivery.healing_defender_admitted_id, "healer")
+        self.assertIsNone(after_delivery.cargo_lane.owner_id)
+        self.assertEqual(after_delivery.core_visit_forced_purpose, "HEAL")
+
+        noncritical = run_case(UnitType.VANGUARD, 3, 1)
+        self.assertIsNone(noncritical.healing_defender_admitted_id)
+        self.assertEqual(noncritical.cargo_lane.owner_id, "queued")
+
+    def test_near_core_wounded_ranger_admits_without_reaching_outer_stage(self):
+        queued = FakeActor("queued", (4, 1), cargo=1)
+        healer = FakeActor("healer", (3, 0), unit_type=UnitType.RANGER)
+        healer.hp = 1
+        reserve = FakeActor("reserve", (6, 2), unit_type=UnitType.RANGER)
+        reserve.hp = 2
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        turn = make_turn(worker=queued, core=core)
+        turn.resources = 20
+        turn.resource_capacity = 30
+        turn.workers = (queued,)
+        turn.rangers = (healer, reserve)
+        turn.units = turn.workers + turn.rangers
+        turn.state.population = len(turn.units)
+        memory = TacticMemory(
+            healing_defender_ids={"healer"},
+            healing_defender_intent_id="healer",
+            healing_defender_intent_tick=turn.tick,
+            healing_defender_stage_target=(5, 0),
+            heal_priority_intent_id="healer",
+            core_visit_deposit_streak=3,
+            core_visit_forced_purpose="HEAL",
+            cargo_lane=CargoLanePlan(
+                active=True,
+                phase="EGRESS",
+                core_position=(0, 0),
+                queued_owner_id="queued",
+                path=((0, 0), (1, 0), (2, 0), (3, 0)),
+                gateway=(3, 0),
+                started_tick=turn.tick - 5,
+                phase_started_tick=turn.tick - 1,
+                geometry_source="SINGLE_OPEN",
+            ),
+        )
+
+        plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
+
+        self.assertEqual(memory.healing_defender_admitted_id, "healer")
+        self.assertNotEqual(healer.position, memory.healing_defender_stage_target)
+        self.assertTrue(any(action[0] in {"MOVE", "HEAL"} for action in healer.actions))
+
+    def test_stalled_defender_heal_admission_rotates_without_losing_quota(self):
         queued = FakeActor("queued", (4, 1), cargo=1)
         healer = FakeActor("healer", (5, 0), unit_type=UnitType.VANGUARD)
         healer.hp = 2
         reserve = FakeActor("reserve", (6, 2), unit_type=UnitType.VANGUARD)
-        reserve.hp = 4
+        reserve.hp = 2
         core = FakeActor("core", (0, 0), shield=5)
         core.hp = 5
         blocked = frozenset({(0, -1), (-1, 0), (0, 1)})
@@ -4801,10 +5331,12 @@ class ArenaAgentTests(unittest.TestCase):
         plan_turn(turn, memory, AgentConfig(spawn_unit_type=None))
 
         self.assertIsNone(memory.healing_defender_admitted_id)
-        self.assertIsNone(memory.healing_defender_intent_id)
+        self.assertEqual(memory.healing_defender_intent_id, "reserve")
         self.assertGreater(memory.healing_defender_cooldowns["healer"], turn.tick)
-        self.assertIsNone(memory.core_visit_forced_purpose)
-        self.assertEqual(memory.cargo_lane.owner_id, "queued")
+        self.assertEqual(memory.heal_priority_intent_id, "reserve")
+        self.assertEqual(memory.core_visit_deposit_streak, 3)
+        self.assertEqual(memory.core_visit_forced_purpose, "HEAL")
+        self.assertIsNone(memory.cargo_lane.owner_id)
 
     def test_egress_watchdog_reports_stalled_departing_without_unsafe_handoff(self):
         departing = FakeActor("departing", (2, 0), cargo=0)
@@ -5661,6 +6193,8 @@ class ArenaAgentTests(unittest.TestCase):
             "游侠状态: 防守:2   出征:0   本轮攻击:1   血量:3/4   未满血:1   危急:1",
             rendered,
         )
+        self.assertIn("物流通道: IDLE", rendered)
+        self.assertIn("治疗通行: 无", rendered)
         self.assertNotIn("工人1", rendered)
         self.assertNotIn("(3, 4)", rendered)
         self.assertIn("生产报价", rendered)
