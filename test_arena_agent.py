@@ -47,6 +47,7 @@ from arena_agent import (
     _render_turn,
     _refresh_cargo_lane_occupants,
     _refresh_healing_defenders,
+    _refresh_healing_worker_stage_target,
     _estimated_path_cost,
     _is_retryable_protocol_error,
     _is_retryable_api_error,
@@ -55,6 +56,7 @@ from arena_agent import (
     _parse_stream_message_with_compatibility,
     _parse_args,
     _queue_move,
+    _plan_workers,
     _reconnect_delay,
     _save_tactic_memory,
     _select_cargo_lane_owner,
@@ -6233,6 +6235,92 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertEqual(report.ranger_defenders, 1)
         self.assertEqual(report.ranger_raid, 0)
         self.assertEqual(report.ranger_attacks, 1)
+
+    def test_remote_healing_worker_stages_outside_active_cargo_lane(self):
+        healer = FakeActor("healer", (10, 10))
+        healer.hp = 1
+        owner = FakeActor("owner", (1, 0), cargo=1)
+        core = FakeActor("core", (0, 0))
+        core.hp = 5
+        turn = make_turn(worker=healer, core=core)
+        turn.tick = 20
+        turn.resources = 20
+        turn.resource_capacity = 100
+        turn.resource_space = 80
+        turn.workers = (healer, owner)
+        turn.units = turn.workers
+        turn.state.population = 2
+        lane = CargoLanePlan(
+            active=True,
+            phase="INBOUND",
+            core_position=core.position,
+            owner_id="owner",
+            path=((0, 0), (1, 0)),
+            gateway=(1, 0),
+        )
+        memory = TacticMemory(
+            healing_worker_ids={"healer"},
+            heal_intent_id="healer",
+            heal_intent_tick=turn.tick,
+            cargo_lane=lane,
+        )
+        occupancy = _friendly_cell_occupancy(turn)
+        target = _refresh_healing_worker_stage_target(
+            turn,
+            core.position,
+            set(),
+            set(),
+            occupancy,
+            memory,
+        )
+
+        self.assertIsNotNone(target)
+        self.assertNotIn(target, lane.path)
+        self.assertEqual(_worker_mode(healer, memory, turn.tick), "HEAL_STAGE")
+
+        _plan_workers(
+            turn,
+            core,
+            set(),
+            None,
+            memory,
+            resource_memory_ttl=32,
+            combat_enemies=[],
+            visible_enemies=[],
+            danger_cells=set(),
+            friendly_occupancy=occupancy,
+        )
+        self.assertTrue(healer.actions)
+        self.assertEqual(healer.actions[0][0], "MOVE")
+        self.assertNotEqual(
+            _next_position(healer.position, healer.actions[0][1]),
+            (0, 0),
+        )
+
+    def test_healing_intent_survives_active_cargo_lane_wait(self):
+        healer = FakeActor("healer", (5, 5))
+        healer.hp = 1
+        core = FakeActor("core", (0, 0))
+        core.hp = 5
+        turn = make_turn(worker=healer, core=core)
+        turn.tick = 20
+        memory = TacticMemory(
+            healing_worker_ids={"healer"},
+            heal_intent_id="healer",
+            heal_intent_tick=1,
+            heal_intent_best_distance=10,
+            cargo_lane=CargoLanePlan(
+                active=True,
+                core_position=core.position,
+                owner_id="owner",
+                path=((0, 0), (1, 0)),
+                gateway=(1, 0),
+            ),
+        )
+
+        memory.observe(turn)
+
+        self.assertEqual(memory.heal_intent_id, "healer")
 
 
 if __name__ == "__main__":

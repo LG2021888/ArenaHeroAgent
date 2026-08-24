@@ -713,6 +713,7 @@ class TacticMemory:
     healing_defender_timeout_tick: int = -1
     healing_defender_cooldowns: dict[str, int] = field(default_factory=dict)
     healing_worker_ids: set[str] = field(default_factory=set)
+    healing_worker_stage_target: Position | None = None
     # A healing intent is a queue reservation, not physical Core ownership.
     # Only a worker standing on the Core cell may populate core_visit.
     heal_intent_id: str | None = None
@@ -935,6 +936,7 @@ class TacticMemory:
             self.heal_intent_id = None
             self.heal_intent_tick = -1
             self.heal_intent_best_distance = None
+        intent_worker = None
         if self.heal_intent_id is not None:
             intent_worker = next(
                 (
@@ -956,10 +958,16 @@ class TacticMemory:
                 ):
                     self.heal_intent_best_distance = intent_distance
                     self.heal_intent_tick = tick
+        waiting_for_cargo_lane = bool(
+            self.cargo_lane.active
+            and intent_worker is not None
+            and int(getattr(intent_worker, "cargo", 0)) <= 0
+        )
         if (
             self.heal_intent_id is not None
             and self.heal_intent_tick >= 0
             and tick - self.heal_intent_tick >= HEAL_INTENT_TIMEOUT_TICKS
+            and not waiting_for_cargo_lane
         ):
             self.heal_intent_cooldowns[self.heal_intent_id] = (
                 tick + HEAL_INTENT_COOLDOWN_TICKS
@@ -2002,6 +2010,8 @@ def _worker_mode(worker: Any, memory: TacticMemory, tick: int) -> str:
         worker_key in memory.healing_worker_ids
         and memory.heal_intent_id == worker_key
     ):
+        if memory.healing_worker_stage_target is not None:
+            return "HEAL_STAGE"
         return "HEAL_RETURN"
     return_target = memory.scout_return_targets.get(worker_key)
     if (
@@ -2391,6 +2401,9 @@ class SessionRecorder:
                 for worker_id, progress in sorted(memory.scout_return_progress.items())
             },
             "healing_worker_ids": sorted(memory.healing_worker_ids),
+            "healing_worker_stage_target": _json_position(
+                memory.healing_worker_stage_target
+            ),
             "healing_defenders": {
                 "candidate_ids": sorted(memory.healing_defender_ids),
                 "intent_id": memory.healing_defender_intent_id,
@@ -6371,11 +6384,82 @@ def _refresh_healing_workers(
         memory.heal_intent_id = None
         memory.heal_intent_tick = -1
         memory.heal_intent_best_distance = None
+        memory.healing_worker_stage_target = None
     if memory.heal_intent_id is None and intent_candidates:
         selected = min(intent_candidates)
         memory.heal_intent_id = selected[2]
         memory.heal_intent_tick = int(getattr(turn, "tick", 0))
         memory.heal_intent_best_distance = selected[1]
+        memory.healing_worker_stage_target = None
+
+
+def _refresh_healing_worker_stage_target(
+    turn: Any,
+    core_position: Position | None,
+    blocked: set[Position],
+    danger_cells: set[Position],
+    friendly_occupancy: dict[Position, int],
+    memory: TacticMemory,
+) -> Position | None:
+    """Keep a remote injured Worker outside an active Cargo corridor."""
+
+    worker_id = memory.heal_intent_id
+    lane = memory.cargo_lane
+    if (
+        worker_id is None
+        or core_position is None
+        or not lane.active
+    ):
+        memory.healing_worker_stage_target = None
+        return None
+    worker = next(
+        (
+            candidate
+            for candidate in getattr(turn, "workers", ())
+            if str(getattr(candidate, "id", "")) == worker_id
+        ),
+        None,
+    )
+    origin = _position(getattr(worker, "position", None))
+    if origin is None or _chebyshev(origin, core_position) <= max(CARGO_LANE_STAGE_RADII):
+        memory.healing_worker_stage_target = None
+        return None
+
+    exclusions = {
+        _next_position(core_position, direction)
+        for direction in CARDINAL_DIRECTIONS
+    }
+    exclusions.update(lane.path)
+    exclusions.update(lane.owner_approach_path)
+    exclusions.update(lane.egress_path)
+    exclusions.update(lane.stage_targets.values())
+    exclusions.update(lane.heal_approach_path)
+    route_blocked = set(blocked) | set(danger_cells) | exclusions
+    route_blocked.discard(origin)
+
+    def valid(target: Position | None) -> bool:
+        if target is None or target in route_blocked:
+            return False
+        if friendly_occupancy.get(target, 0) - int(target == origin) > 0:
+            return False
+        return _complete_route(origin, target, route_blocked).status == "SUCCESS"
+
+    if valid(memory.healing_worker_stage_target):
+        return memory.healing_worker_stage_target
+
+    candidates: list[tuple[int, int, int, int, Position]] = []
+    for radius in reversed(CARGO_LANE_STAGE_RADII):
+        for target in _chebyshev_ring_positions(core_position, radius):
+            if not valid(target):
+                continue
+            route = _complete_route(origin, target, route_blocked)
+            candidates.append(
+                (len(route.path), radius, target[0], target[1], target)
+            )
+    memory.healing_worker_stage_target = (
+        min(candidates)[-1] if candidates else None
+    )
+    return memory.healing_worker_stage_target
 
 
 def _adjacent_direction(origin: Position, target: Position) -> Direction | None:
@@ -8094,6 +8178,32 @@ def _plan_workers(
                         continue
                 worker.wait()
                 continue
+
+        if worker_key == memory.heal_intent_id and memory.cargo_lane.active:
+            stage_target = _refresh_healing_worker_stage_target(
+                turn,
+                core_position,
+                worker_return_blocked | contested_positions,
+                danger_cells,
+                friendly_occupancy,
+                memory,
+            )
+            if stage_target is not None and worker_position != stage_target:
+                moved, _, _ = _queue_worker_route(
+                    worker,
+                    stage_target,
+                    "HEAL_STAGE",
+                    worker_return_blocked | contested_positions,
+                    reserved_destinations,
+                    friendly_occupancy,
+                    memory,
+                )
+                if moved:
+                    continue
+            # A healing Worker must wait outside the active corridor. It
+            # will be routed to Core after the half-duplex owner clears.
+            worker.wait()
+            continue
 
         if injured_far_from_core:
             moved, _, _ = _queue_worker_route(
