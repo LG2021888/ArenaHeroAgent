@@ -267,3 +267,27 @@ Only decisions with direct repository or runtime evidence are recorded here.
   cleanup, and the 205-test suite. Later live evidence shows that Worker
   staging/progress and repeated watchdog recovery still need refinement; that
   open work does not change the physical-access decision.
+
+## 2026-08-24 - Stage Remote Worker Healing Around Active Cargo
+
+- **Decision:** When an injured empty Worker has a healing intent but Cargo
+  owns the active single-entry lane, route it to a safe outer Core staging
+  cell that excludes the lane path, egress path, and Cargo staging cells. Keep
+  the healing intent while it waits; suspend the 12-Tick intent timeout during
+  this active-lane wait. After the lane is idle, resume the normal HEAL route
+  and create the physical `core_visit` only on the Core cell.
+- **Reason:** Live session `d2c786c67adb46018f94beb38909d6ab` showed Worker
+  `8905b634-67a2-4ad1-ab19-0502ca66fa89` repeatedly losing intent while its
+  path detoured around Cargo. The old no-Manhattan-progress timeout treated a
+  valid staging detour as failure and returned the Worker to `SCOUT_RETURN`.
+- **Rejected alternative:** Let the Worker reserve Cargo corridor cells,
+  grant remote physical Core ownership, or disable the timeout globally.
+- **Impact:** Cargo remains half-duplex and can complete deposits/egress;
+  remote healing becomes a durable queue reservation with explicit staging.
+  The repair is covered by the 219-test suite and live session
+  `5760788568524aec9a31a06802dd6169`, where the intent survived beyond the
+  timeout window and Cargo watchdog/error counts remained zero. A new Worker
+  `UNIT_HEAL_SUCCEEDED` is still pending live observation.
+- **Evidence:** Commit `ec63567`, `_refresh_healing_worker_stage_target`, the
+  active-lane timeout guard in `TacticMemory.observe`, staging/intent regression
+  tests, and post-restart trace ticks 161552-161593.

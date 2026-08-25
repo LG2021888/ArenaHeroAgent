@@ -93,7 +93,10 @@ closed-pocket and single-entrance geometry.
   reservation, not physical Core ownership; the one-slot `core_visit` is
   granted only to a Unit already on the Core cell. A staged healer may earn
   priority after at most three completed deposits, while remote healing intent
-  must not stop Cargo startup or handoff.
+  must not stop Cargo startup or handoff. Remote low-health Workers use an
+  explicit outer staging target while Cargo owns the lane; their intent timeout
+  is suspended during that active-lane wait and resumes only once the lane is
+  available for Core approach.
 - Keep Worker-local combat memory separate from Core-level threat. Retain all
   hostile attack positions for Worker escape and return routing, but refresh
   Core recent-attack state only when the Core is targeted or the attack is
