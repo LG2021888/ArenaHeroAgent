@@ -5015,6 +5015,40 @@ def _admit_healing_defender(
     return True
 
 
+def _healing_worker_lane_access_ready(
+    turn: Any,
+    memory: TacticMemory,
+    worker_id: str,
+) -> bool:
+    """Return whether a queued healing Worker may cross a safe EGRESS lane."""
+    lane = memory.cargo_lane
+    if not (
+        lane.active
+        and lane.phase == "EGRESS"
+        and memory.heal_intent_id == worker_id
+        and memory.heal_priority_intent_id == worker_id
+        and memory.core_visit_forced_purpose == "HEAL"
+        and lane.owner_id is None
+        and lane.departing_worker_id is None
+        and not lane.startup_pending_ids
+        and memory.core_visit.unit_id in {None, worker_id}
+    ):
+        return False
+    worker = next(
+        (
+            candidate
+            for candidate in getattr(turn, "workers", ())
+            if str(getattr(candidate, "id", "")) == worker_id
+        ),
+        None,
+    )
+    return bool(
+        worker is not None
+        and int(getattr(worker, "cargo", 0)) == 0
+        and int(getattr(worker, "hp", 0)) < _unit_max_hp(UnitType.WORKER)
+    )
+
+
 def _refresh_cargo_lane_occupants(
     turn: Any,
     memory: TacticMemory,
@@ -5086,13 +5120,37 @@ def _refresh_cargo_lane_occupants(
         )
         if heal_route.status == "SUCCESS":
             heal_approach_path = tuple(heal_route.path)
+    admitted_worker_id = (
+        memory.heal_intent_id
+        if _healing_worker_lane_access_ready(
+            turn,
+            memory,
+            memory.heal_intent_id or "",
+        )
+        else None
+    )
+    admitted_healing_worker = workers_by_id.get(admitted_worker_id or "")
+    admitted_worker_position = _position(
+        getattr(admitted_healing_worker, "position", None)
+    )
+    if admitted_worker_position is not None:
+        worker_heal_route = _complete_route(
+            admitted_worker_position,
+            lane.core_position,
+            blocked | danger_cells,
+        )
+        if worker_heal_route.status == "SUCCESS":
+            heal_approach_path = tuple(worker_heal_route.path)
     lane.heal_approach_path = heal_approach_path
     staging_exclusions = (
         lane_positions
         | owner_approach_positions
         | set(heal_approach_path)
     )
-    if memory.healing_defender_admitted_id is not None:
+    if (
+        memory.healing_defender_admitted_id is not None
+        or admitted_worker_id is not None
+    ):
         # A blocker beside the healing route can pin the next blocker on the
         # route itself. Include the route's one-cell neighborhood so the
         # clearance planner can form a deterministic yield chain.
@@ -5127,10 +5185,12 @@ def _refresh_cargo_lane_occupants(
         and str(getattr(worker, "id", "")) not in lane.startup_pending_ids
         and _position(getattr(worker, "position", None))
         in staging_exclusions | core_neighbors
+        and str(getattr(worker, "id", "")) != admitted_worker_id
         and not (
             str(getattr(worker, "id", "")) == lane.queued_owner_id
             and _position(getattr(worker, "position", None)) == lane.gateway
             and memory.healing_defender_admitted_id is None
+            and admitted_worker_id is None
         )
     }
     lane.yield_unit_ids = {
@@ -5153,7 +5213,16 @@ def _refresh_cargo_lane_occupants(
         for unit in getattr(turn, "units", ())
         if str(getattr(unit, "id", "")) in yielding_ids
     }
-    clearance_positions = staging_exclusions | core_neighbors
+    owner_approach_neighborhood = {
+        _next_position(position, direction)
+        for position in owner_approach_path
+        for direction in CARDINAL_DIRECTIONS
+    }
+    clearance_positions = (
+        staging_exclusions
+        | owner_approach_neighborhood
+        | core_neighbors
+    )
     unavailable_positions = set(friendly_occupancy)
     unavailable_positions.update(
         _positions(getattr(turn, "resource_cells", ()))
@@ -7600,6 +7669,7 @@ def _cargo_lane_temporary_release_route(
         destination = _next_position(origin, direction)
         if (
             destination in protected_positions
+            or destination in owner_approach_positions
             or destination in blocked
             or destination in unavailable
             or destination in reserved
@@ -7618,7 +7688,53 @@ def _cargo_lane_temporary_release_route(
             )
         )
     if not candidates:
-        return None
+        # A one-cell sidestep can be unavailable in a dense Core apron. Find
+        # a short route to an actually open cell instead of placing the
+        # blocker on the admitted owner's approach path.
+        search_blocked = (
+            set(protected_positions)
+            | set(owner_approach_positions)
+            | set(blocked)
+            | set(unavailable)
+            | set(reserved)
+        )
+        search_blocked.discard(origin)
+        frontier = deque((origin,))
+        parents: dict[Position, Position] = {}
+        distances = {origin: 0}
+        alternatives: list[tuple[int, int, int, int, Position]] = []
+        while frontier:
+            current = frontier.popleft()
+            distance = distances[current]
+            if distance >= CARGO_LANE_OWNER_ADMISSION_STEPS:
+                continue
+            for index, direction in enumerate(CARDINAL_DIRECTIONS):
+                destination = _next_position(current, direction)
+                if destination in distances or destination in search_blocked:
+                    continue
+                distances[destination] = distance + 1
+                parents[destination] = current
+                alternatives.append(
+                    (
+                        int(destination not in {
+                            _next_position(lane.core_position, neighbor_direction)
+                            for neighbor_direction in CARDINAL_DIRECTIONS
+                        }),
+                        _manhattan(destination, lane.core_position),
+                        -distance,
+                        -index,
+                        destination,
+                    )
+                )
+                frontier.append(destination)
+        if not alternatives:
+            return None
+        target = max(alternatives)[-1]
+        route = [target]
+        while route[-1] != origin:
+            route.append(parents[route[-1]])
+        route.reverse()
+        return tuple(route)
     return origin, max(candidates)[-1]
 
 
@@ -8178,6 +8294,29 @@ def _plan_workers(
                         continue
                 worker.wait()
                 continue
+
+        if _healing_worker_lane_access_ready(turn, memory, worker_key):
+            if worker_position == core_position:
+                if memory.core_visit.unit_id in {None, worker_key}:
+                    memory.core_visit = CoreVisit(
+                        worker_key, "HEAL", tick, reached_core=True
+                    )
+                    worker.heal()
+                else:
+                    worker.wait()
+            else:
+                moved, _, _ = _queue_worker_route(
+                    worker,
+                    core_position,
+                    "HEAL",
+                    worker_return_blocked | contested_positions,
+                    reserved_destinations,
+                    friendly_occupancy,
+                    memory,
+                )
+                if not moved:
+                    worker.wait()
+            continue
 
         if worker_key == memory.heal_intent_id and memory.cargo_lane.active:
             stage_target = _refresh_healing_worker_stage_target(

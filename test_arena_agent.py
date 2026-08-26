@@ -4720,6 +4720,24 @@ class ArenaAgentTests(unittest.TestCase):
             held=True,
         )
         self.assertEqual(route, ((-192, 681), (-192, 680)))
+    def test_temporary_release_never_enters_owner_approach(self):
+        lane = CargoLanePlan(
+            active=True,
+            core_position=(0, 0),
+            path=((0, 0), (0, 1)),
+        )
+        route = _cargo_lane_temporary_release_route(
+            (1, 1),
+            lane,
+            {(1, 1), (1, 0)},
+            {(1, 2), (2, 1)},
+            set(),
+            set(),
+            held=True,
+        )
+
+        self.assertIsNone(route)
+
 
     def test_unadmitted_wounded_vanguard_yields_then_stages_outside_lane(self):
         cargo = FakeActor("cargo", (4, 0), cargo=1)
@@ -6235,6 +6253,83 @@ class ArenaAgentTests(unittest.TestCase):
         self.assertEqual(report.ranger_defenders, 1)
         self.assertEqual(report.ranger_raid, 0)
         self.assertEqual(report.ranger_attacks, 1)
+
+    def test_worker_healing_admission_precedes_egress_cargo_handoff(self):
+        queued = FakeActor("queued", (3, 1), cargo=1)
+        healer = FakeActor("healer", (4, 2), cargo=0)
+        healer.hp = 1
+        core = FakeActor("core", (0, 0), shield=5)
+        core.hp = 5
+        blocked = frozenset({(0, -1), (-1, 0), (0, 1)})
+        turn = make_turn(worker=queued, core=core, obstacles=blocked)
+        turn.tick = 40
+        turn.resources = 20
+        turn.resource_capacity = 100
+        turn.resource_space = 80
+        turn.workers = (queued, healer)
+        turn.units = turn.workers
+        turn.state.population = len(turn.units)
+        memory = TacticMemory(
+            healing_worker_ids={"healer"},
+            heal_intent_id="healer",
+            heal_intent_tick=turn.tick,
+            heal_intent_best_distance=6,
+            heal_priority_intent_id="healer",
+            heal_priority_started_tick=turn.tick,
+            core_visit_deposit_streak=3,
+            core_visit_forced_purpose="HEAL",
+            cargo_lane=CargoLanePlan(
+                active=True,
+                phase="EGRESS",
+                core_position=core.position,
+                queued_owner_id="queued",
+                path=((0, 0), (1, 0), (2, 0), (3, 0)),
+                gateway=(3, 0),
+                started_tick=1,
+                phase_started_tick=39,
+                geometry_source="SINGLE_OPEN",
+            ),
+        )
+        config = AgentConfig(spawn_unit_type=None)
+        first_tick = turn.tick
+        heal_tick = None
+
+        for _ in range(20):
+            action_tick = turn.tick
+            plan_turn(turn, memory, config)
+            self.assertNotIn("healer", memory.cargo_lane.yield_worker_ids)
+            self.assertIsNone(memory.cargo_lane.owner_id)
+            self.assertIn(healer.position, memory.cargo_lane.heal_approach_path)
+            if healer.actions == [("HEAL",)]:
+                heal_tick = action_tick
+                break
+            self.assertTrue(
+                any(action[0] == "MOVE" for action in healer.actions),
+                f"actions={healer.actions} lane={memory.cargo_lane}",
+            )
+            move = next(action for action in healer.actions if action[0] == "MOVE")
+            self.assertIn(
+                _next_position(healer.position, move[1]),
+                memory.cargo_lane.heal_approach_path,
+            )
+            apply_synchronous_actions(turn)
+
+        self.assertIsNotNone(heal_tick)
+        self.assertLess(heal_tick - first_tick, 32)
+        self.assertEqual(healer.position, core.position)
+        self.assertEqual(memory.core_visit.unit_id, "healer")
+        self.assertEqual(memory.core_visit.purpose, "HEAL")
+
+        healer.hp = 2
+        for actor in (*turn.units, turn.core):
+            actor.actions.clear()
+        turn.events = ()
+        turn.tick += 1
+        plan_turn(turn, memory, config)
+
+        self.assertEqual(memory.cargo_lane.phase, "INBOUND")
+        self.assertEqual(memory.cargo_lane.owner_id, "queued")
+        self.assertIsNone(memory.core_visit.unit_id)
 
     def test_remote_healing_worker_stages_outside_active_cargo_lane(self):
         healer = FakeActor("healer", (10, 10))
